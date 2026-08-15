@@ -32,6 +32,7 @@ curl -Lo ~/.pi/agent/extensions/agent-status.ts \
 ```
 
 On Windows, `~` maps to `%USERPROFILE%` → `%USERPROFILE%\.pi\agent\extensions\agent-status.ts`.
+**Prefer a script?** Run `bash ./install.sh` — idempotent: clones/pulls the repo into `~/.pi/agent/.extension-src/` and copies the single file.
 
 ### Option B — whole repo
 
