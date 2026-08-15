@@ -35,6 +35,18 @@ curl -Lo ~/.pi/agent/extensions/agent-status.ts \
 On Windows, `~` maps to `%USERPROFILE%` → `%USERPROFILE%\.pi\agent\extensions\agent-status.ts`.
 **Prefer a script?** Run `bash ./install.sh` — idempotent: clones/pulls the repo into `~/.pi/agent/.extension-src/` and copies the single file.
 
+### Dev install — local changes, no push
+
+`install.sh` only ever pulls from GitHub, so it's blind to uncommitted local edits. For active development use **`./dev-install.sh`**, which copies straight from your working tree:
+
+```bash
+./dev-install.sh              # copy local agent-status.ts once, then /reload
+./dev-install.sh --watch      # poll every 1s; re-copy automatically on save
+./dev-install.sh <path>       # copy a specific file instead of agent-status.ts
+```
+
+`--watch` compares a checksum each tick and only re-copies on an actual change, so saving the file immediately propagates it into `~/.pi/agent/extensions/agent-status.ts` (run `/reload` once to pick up the new module). Ctrl-C stops it.
+
 ### Option B — whole repo
 
 ```bash
