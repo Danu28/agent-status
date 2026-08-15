@@ -1,3 +1,6 @@
 # dev dependencies (pi types, typescript) — install via `npm install`
 node_modules/
 *.tsbuildinfo
+
+# harness run state
+.harness/
