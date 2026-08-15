@@ -5,8 +5,6 @@
   "keywords": ["pi", "pi-extension", "extension", "status", "footer", "tui"],
   "license": "MIT",
   "type": "module",
-  "main": "agent-status.ts",
-  "files": ["agent-status.ts"],
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
