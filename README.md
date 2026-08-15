@@ -55,7 +55,7 @@ Environment variables (optional):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AGENT_STATUS_STUCK_MS` | `60000` | Milliseconds of silence before the stuck warning appears. Values that are `NaN`, `0`, or negative fall back to the default. |
+| `AGENT_STATUS_STUCK_MS` | `60000` | Milliseconds of silence before the stuck warning appears. `NaN`/`0` fall back to the default; negative values clamp to a 1s floor (`Math.max(1000, …)`) so the watchdog can never be silently disabled. |
 | `AGENT_STATUS_ENABLED` | `1` | Set to `0` to disable the extension entirely. |
 
 ```bash
