@@ -13,6 +13,7 @@ Single-file, zero dependencies, no configuration required — drop it in and `/r
 | **● running · tool: X** | A tool is executing |
 | **⚠ no activity Ns** | Busy but no event arrived for `AGENT_STATUS_STUCK_MS` (default 60s). During a tool phase this likely means a hung execution — `Esc` to abort. During thinking/streaming it may just be a long silent reasoning window — abort only if it never progresses. |
 | **✓ idle** | Agent settled; pi is waiting for input |
+| **… · 2m10s** | Busy statuses also append the wall-clock duration of the current run, so you can see at a glance how long the agent has been working. |
 
 "Activity" = any agent/turn/message/tool event. A watchdog re-checks every 2s and flips to the stuck warning only while the agent is busy.
 
@@ -58,10 +59,12 @@ Environment variables (optional):
 |----------|---------|-------------|
 | `AGENT_STATUS_STUCK_MS` | `60000` | Milliseconds of silence before the stuck warning appears. `NaN`/`0` fall back to the default; negative values clamp to a 1s floor (`Math.max(1000, …)`) so the watchdog can never be silently disabled. |
 | `AGENT_STATUS_ENABLED` | `1` | Set to `0` to disable the extension entirely. |
+| `AGENT_STATUS_ELAPSED` | `1` | Set to `0` to hide the running-session duration appended to busy statuses. |
 
 ```bash
 AGENT_STATUS_STUCK_MS=120000 pi          # quieter watchdog (120s)
 AGENT_STATUS_ENABLED=0 pi                # disable
+AGENT_STATUS_ELAPSED=0 pi                # hide the running-session timer
 ```
 
 ## How it works

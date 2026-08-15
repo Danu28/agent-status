@@ -12,6 +12,11 @@
  *                        reasoning window — abort only if it never progresses.
  *   ✓ idle             — agent settled; pi is waiting for input
  *
+ * Busy statuses also show the wall-clock duration of the current run
+ * (e.g. "● running · 2m10s", "● running · tool: X · 45s") so you can see at a
+ * glance how long the agent has been working — handy alongside the stuck
+ * watchdog when deciding whether to keep waiting or abort.
+ *
  * "Activity" = any agent/turn/message/tool event. The watchdog re-checks every
  * 2s and flips to the stuck warning only while the agent is busy.
  *
@@ -32,6 +37,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const STUCK_MS = Math.max(1_000, Number(process.env.AGENT_STATUS_STUCK_MS) || 60_000);
 const CHECK_INTERVAL_MS = 2_000;
 const ENABLED = (process.env.AGENT_STATUS_ENABLED ?? "1") !== "0";
+const SHOW_ELAPSED = (process.env.AGENT_STATUS_ELAPSED ?? "1") !== "0";
 const KEY = "agent-status";
 
 export default function (pi: ExtensionAPI) {
@@ -41,7 +47,19 @@ export default function (pi: ExtensionAPI) {
   let phase: "thinking" | "streaming" | "tool" | "idle" = "idle";
   let toolName = "";
   let lastActivity = Date.now();
+  let runStart = 0;
   let lastRendered = "";
+
+  /** Compact elapsed formatter: 45s, 2m10s, 1h03m20s. */
+  const fmtElapsed = (ms: number): string => {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}h${m.toString().padStart(2, "0")}m${s.toString().padStart(2, "0")}s`;
+    if (m > 0) return `${m}m${s.toString().padStart(2, "0")}s`;
+    return `${s}s`;
+  };
 
   /** Mark activity; keeps the stuck watchdog from firing. */
   const touch = (p: typeof phase, tool?: string) => {
@@ -71,6 +89,7 @@ export default function (pi: ExtensionAPI) {
       } else {
         s = fg("accent", "●") + " running";
       }
+      if (SHOW_ELAPSED && runStart) s += ` · ${fmtElapsed(Date.now() - runStart)}`;
     }
     if (s !== lastRendered) {
       lastRendered = s;
@@ -80,6 +99,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", async (_e, ctx) => {
     ui = ctx.ui;
+    runStart = Date.now();
     touch("thinking");
     render();
   });
