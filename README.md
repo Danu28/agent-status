@@ -1,6 +1,6 @@
 # agent-status
 
-A [pi](https://github.com/earendil-works/pi) extension that shows the agent's live state in the footer.
+A [pi](https://github.com/earendil-works/pi) extension that shows the agent's live state in the footer, plus a `/agent-session-status` command that reports everything recorded in the last session file.
 
 Single-file, zero dependencies, no configuration required — drop it in and `/reload`.
 
@@ -16,6 +16,24 @@ Single-file, zero dependencies, no configuration required — drop it in and `/r
 | **… · 2m10s** | Busy statuses also append the wall-clock duration of the current run, so you can see at a glance how long the agent has been working. |
 
 "Activity" = any agent/turn/message/tool event. A watchdog re-checks every 2s and flips to the stuck warning only while the agent is busy.
+
+## Session status report
+
+`/agent-session-status` parses the most recent session file (`~/.pi/agent/sessions/--<cwd>--/*.jsonl`) for the current project and shows an aggregated report as a widget above the editor:
+
+- session id, file, creation time, cwd, fork parent, span + longest idle gap
+- LLM calls, per-model breakdown, token usage (in/out/cacheRead/cacheWrite/reasoning), cost
+- stop reasons, model switches, thinking levels
+- tool calls/results with failure counts, bash commands with exit codes (consecutive repeats collapsed)
+- error messages, compactions, branch summaries, custom/extension events
+
+| Argument | Effect |
+|----------|--------|
+| *(none)* | Show the newest session with content (normally the current one) |
+| `prev` | Show the previous session instead |
+| `clear` | Hide the panel |
+
+Re-run the command to refresh the panel. Requires a persisted session (not `--no-session`); with no UI (print/json mode) the report falls back to a notification.
 
 ## Install
 
