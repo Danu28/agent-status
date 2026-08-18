@@ -272,6 +272,9 @@ function renderReport(file: string, entries: FileEntry[], priorLine?: string): s
   }
 
   // ── Boxed summary output (pi-reasonix-style layout) ─────────────────────
+  // pi renders extension widgets with a hard 10-line cap (MAX_WIDGET_LINES)
+  // and appends "... (widget truncated)" beyond it — keep the report ≤ 10
+  // lines so every field is visible.
   const W = 46; // inner box width (matches the reference template)
   const project = (header?.cwd?.split(/[\\/]/).filter(Boolean).pop() ?? "?") as string;
   // Keep the title inside the box even for very long directory names.
@@ -283,14 +286,9 @@ function renderReport(file: string, entries: FileEntry[], priorLine?: string): s
     `╔${bar}╗`,
     `║${' '.repeat(left)}${title}${' '.repeat(right)}║`,
     `╚${bar}╝`,
-    "",
   ];
   const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - s.length));
-  const fld = (label: string, value: string) => `   ${pad(label, 15)}${value}`; // value col 18
-  const sub = (label: string, value: string) => `     ${pad(label, 13)}${value}`; // value col 18 (cache)
-  const subW = (label: string, value: string) => `     ${pad(label, 14)}${value}`; // value col 19 (cache, long labels)
-  const sub2 = (label: string, value: string) => `     ${pad(label, 20)}${value}`; // value col 25 (repairs)
-  const sub3 = (label: string, value: string) => `     ${pad(label, 19)}${value}`; // value col 24 (cost control)
+  const row = (label: string, value: string) => `   ${pad(label, 18)}${value}`; // value col 21
 
   const noCalls = assistants === 0;
   const primary = [...models.values()].sort((a, b) => b.calls - a.calls)[0];
@@ -300,31 +298,12 @@ function renderReport(file: string, entries: FileEntry[], priorLine?: string): s
   const totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite + usage.reasoning;
   const totalFmt = totalTokens >= 1_000_000 ? `${(totalTokens / 1_000_000).toFixed(1)}M` : `${(totalTokens / 1000).toFixed(1)}K`;
 
-  L.push(fld("Active:", noCalls ? "— (no calls yet)" : `✅ Yes (${primary.key})`));
-  L.push(fld("Prefix hash:", noCalls ? "(no calls yet)" : "--"));
-  L.push(fld("Prefix stable:", noCalls ? "⏳ (no calls yet)" : "⏳ --"));
-  L.push(fld("Calls:", `${assistants} since last reset`));
-  L.push(fld("Truncations:", String(truncations)));
-  L.push("");
-  L.push("   📊 Cache");
-  L.push(sub("Hit tokens:", fmt(usage.cacheRead)));
-  L.push(sub("Miss tokens:", fmt(usage.input)));
-  L.push(subW("Write tokens:", fmt(usage.cacheWrite)));
-  L.push(subW("Hit ratio:", hitRatio === null ? "-- (no calls yet)" : `${hitRatio.toFixed(1)}%`));
-  L.push("");
-  L.push("   🔧 Repairs");
-  L.push(sub2("Args repaired:", "0"));
-  L.push(sub2("Calls scavenged:", "0"));
-  L.push(sub2("Storms suppressed:", "0"));
-  L.push("");
-  L.push("   💰 Cost Control");
-  L.push(sub3("Results compacted:", String(compactions.length)));
-  L.push(sub3("Cap (tokens):", "--"));
-  L.push(sub3("Scavenge:", "off"));
-  L.push("");
-  L.push(`   🔄 Turns:  ${user}`);
-  L.push(`   📦 Tokens: ~${totalFmt} total`);
-  L.push("");
+  L.push(row("Active:", noCalls ? "— (no calls yet)" : `✅ Yes (${primary.key})`));
+  L.push(row("Calls:", `${assistants} · truncations ${truncations} · turns ${user} · 📦 ~${totalFmt} tokens`));
+  L.push(row("Prefix:", noCalls ? "hash (no calls yet) · stable ⏳ (no calls yet)" : "hash -- · stable ⏳ --"));
+  L.push(row("📊 Cache:", `hit ${fmt(usage.cacheRead)} · miss ${fmt(usage.input)} · write ${fmt(usage.cacheWrite)} · ${hitRatio === null ? "-- (no calls yet)" : `${hitRatio.toFixed(1)}%`}`));
+  L.push(row("🔧 Repairs:", "args 0 · scavenged 0 · storms 0"));
+  L.push(row("💰 Cost:", `compacted ${compactions.length} · cap -- · scavenge off`));
   L.push(priorLine ?? "[prior run] (none yet)");
   return L.join("\n");
 }
