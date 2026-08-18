@@ -29,10 +29,11 @@
  * hook is not exposed by the extension API.
  *
  * Also registers the /agent-session-status command: parses the last session
- * file (JSONL) for this project and shows an aggregated report as a widget
- * above the editor — LLM calls, tokens, cost, stop reasons, tools, bash
- * commands, timeline, compaction. Run it again to refresh; pass `clear` to
- * hide the panel, `prev` to show the previous session.
+ * file (JSONL) for this project and shows a compact boxed summary as a widget
+ * above the editor — active model, calls, truncations, cache hit/miss/write
+ * + ratio, repairs, cost control (compactions), turns, total tokens, and the
+ * previous run's calls/cost. Run it again to refresh; pass `clear` to hide
+ * the panel, `prev` to show the previous session.
  *
  * Tuning: AGENT_STATUS_STUCK_MS (default 60000). Disable: AGENT_STATUS_ENABLED=0.
  */
@@ -143,8 +144,28 @@ function collapseBash(items: { cmd: string; exit: string }[]): { cmd: string; ex
   return out;
 }
 
-/** Aggregate the session-file dataset and render it as a text report. */
-function renderReport(file: string, entries: FileEntry[]): string {
+/** One-line footer for the previous session: `[prior run] done · N calls · $X`. */
+function priorRunLine(file: string): string | undefined {
+  try {
+    const entries = parseSessionEntries(readFileSync(file, "utf8"));
+    let calls = 0;
+    let cost = 0;
+    for (const e of entries) {
+      if (e.type !== "message") continue;
+      const m: any = (e as any).message;
+      if (m?.role !== "assistant") continue;
+      calls++;
+      cost += m?.usage?.cost?.total ?? 0;
+    }
+    if (calls === 0) return undefined;
+    return `[prior run] done · ${calls} call${calls === 1 ? "" : "s"} · $${cost.toFixed(4)}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Aggregate the session-file dataset and render it as a boxed summary. */
+function renderReport(file: string, entries: FileEntry[], priorLine?: string): string {
   const header = entries[0] as SessionHeader | undefined;
   const body = entries.slice(1);
 
@@ -250,56 +271,63 @@ function renderReport(file: string, entries: FileEntry[]): string {
     usage.cost += a.cost;
   }
 
-  const start = Date.parse(header?.timestamp ?? "");
-  const span = start && lastTs ? lastTs - start : 0;
-  const L: string[] = [];
-  const name = (header?.cwd?.split(/[\\/]/).filter(Boolean).pop() ?? "?") as string;
-  L.push(`Agent Session Status — ${name}`);
-  const fname = file.split(/[\\/]/).pop() ?? file;
-  L.push(`File: ${fname.length > 56 ? fname.slice(0, 22) + "…" + fname.slice(-30) : fname}`);
-  const created = (header?.timestamp ?? "").replace("T", " ").replace(/\.\d+Z$/, "Z");
-  L.push(`ID: ${header?.id ?? "?"}${header?.version ? ` (v${header.version})` : ""} · created ${created}`);
-  if (header?.parentSession) L.push(`Forked from: ${header.parentSession}`);
-  if (header?.cwd) L.push(`Cwd: ${header.cwd}`);
-  if (span > 0) {
-    L.push(`Span: ${fmtDur(span)}${maxGap > 5_000 ? ` · longest idle gap ${fmtDur(maxGap)}` : ""}`);
-  }
+  // ── Boxed summary output (pi-reasonix-style layout) ─────────────────────
+  const project = (header?.cwd?.split(/[\\/]/).filter(Boolean).pop() ?? "?") as string;
+  const title = `${project} Status`;
+  const W = 46; // inner box width (matches the reference template)
+  const bar = "═".repeat(W);
+  const left = Math.max(0, Math.floor((W - title.length) / 2));
+  const right = Math.max(0, W - title.length - left);
+  const L: string[] = [
+    `╔${bar}╗`,
+    `║${' '.repeat(left)}${title}${' '.repeat(right)}║`,
+    `╚${bar}╝`,
+    "",
+  ];
+  const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - s.length));
+  const fld = (label: string, value: string) => `   ${pad(label, 15)}${value}`; // value col 18
+  const sub = (label: string, value: string) => `     ${pad(label, 13)}${value}`; // value col 18 (cache)
+  const subW = (label: string, value: string) => `     ${pad(label, 14)}${value}`; // value col 19 (cache, long labels)
+  const sub2 = (label: string, value: string) => `     ${pad(label, 20)}${value}`; // value col 25 (repairs)
+  const sub3 = (label: string, value: string) => `     ${pad(label, 19)}${value}`; // value col 24 (cost control)
+
+  const noCalls = assistants === 0;
+  const primary = [...models.values()].sort((a, b) => b.calls - a.calls)[0];
+  const truncations = (stopReasons.get("truncated") ?? 0) + (stopReasons.get("max_tokens") ?? 0);
+  const hitRatio = usage.cacheRead + usage.input > 0 ? (usage.cacheRead / (usage.cacheRead + usage.input)) * 100 : null;
+  // Session usage records don't always carry a `total` — sum the parts.
+  const totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite + usage.reasoning;
+  const totalFmt = totalTokens >= 1_000_000 ? `${(totalTokens / 1_000_000).toFixed(1)}M` : `${(totalTokens / 1000).toFixed(1)}K`;
+
+  L.push(fld("Active:", noCalls ? "— (no calls yet)" : `✅ Yes (${primary.key})`));
+  L.push(fld("Prefix hash:", noCalls ? "(no calls yet)" : "--"));
+  L.push(fld("Prefix stable:", noCalls ? "⏳ (no calls yet)" : "⏳ --"));
+  L.push(fld("Calls:", `${assistants} since last reset`));
+  L.push(fld("Truncations:", String(truncations)));
   L.push("");
-  L.push(`LLM calls: ${assistants} · user msgs: ${user}${imgs ? ` · images: ${imgs}` : ""}`);
-  if (models.size === 1) {
-    const [agg] = [...models.values()];
-    L.push(`Model: ${agg.key} ×${agg.calls} · $${agg.cost.toFixed(4)}`);
-  } else if (models.size > 1) {
-    L.push(`Models (${models.size}):`);
-    for (const agg of models.values()) L.push(`  ${agg.key} ×${agg.calls} · $${agg.cost.toFixed(4)}`);
-  }
-  L.push(`Tokens: in ${fmt(usage.input)} · out ${fmt(usage.output)} · cacheRead ${fmt(usage.cacheRead)} · cacheWrite ${fmt(usage.cacheWrite)}${usage.reasoning ? ` · reasoning ${fmt(usage.reasoning)}` : ""}`);
-  L.push(`Cost: $${usage.cost.toFixed(4)}`);
-  if (stopReasons.size) L.push(`Stop reasons: ${[...stopReasons].map(([k, v]) => `${k} ×${v}`).join(" · ")}`);
-  if (modelChanges.length) {
-    const set = [...new Set(modelChanges)];
-    L.push(`Model switches: ${modelChanges.length}${set.length > 1 ? ` (${set.join(" → ")})` : ""}`);
-  }
-  if (thinking.size) L.push(`Thinking levels: ${[...thinking].map(([k, v]) => `${k} ×${v}`).join(" · ")}`);
-  L.push(`Tools: ${toolCalls} calls · ${toolResults} results · ${toolErr} failed`);
-  if (tools.size) L.push(`  ${[...tools].map(([k, v]) => `${k} ×${v.calls}${v.errors ? ` (${v.errors} err)` : ""}`).join(" · ")}`);
-  if (bash.length) {
-    const collapsed = collapseBash(bash);
-    L.push(`Bash: ${bash.length} commands · ${bash.length - bashErr} ok · ${bashErr} failed`);
-    for (const b of collapsed.slice(0, 6)) {
-      L.push(`  $ ${trunc(b.cmd, 56)} — exit ${b.exit}${b.repeats > 1 ? ` ×${b.repeats}` : ""}`);
-    }
-    if (collapsed.length > 6) L.push(`  … ${collapsed.length - 6} more`);
-  }
-  if (errors.length) {
-    L.push(`Errors: ${errors.length}`);
-    for (const er of errors.slice(0, 4)) L.push(`  ${trunc(er, 100)}`);
-  }
-  if (compactions.length) L.push(`Compactions: ${compactions.length}${compactions.some(Boolean) ? ` (freed up to ${fmt(Math.max(...compactions))} tokens)` : ""}`);
-  if (branch) L.push(`Branch summaries: ${branch}`);
-  if (custom.size) L.push(`Custom events: ${[...custom].map(([k, v]) => `${k} ×${v}`).join(" · ")}`);
+  L.push("   📊 Cache");
+  L.push(sub("Hit tokens:", fmt(usage.cacheRead)));
+  L.push(sub("Miss tokens:", fmt(usage.input)));
+  L.push(subW("Write tokens:", fmt(usage.cacheWrite)));
+  L.push(subW("Hit ratio:", hitRatio === null ? "-- (no calls yet)" : `${hitRatio.toFixed(1)}%`));
+  L.push("");
+  L.push("   🔧 Repairs");
+  L.push(sub2("Args repaired:", "0"));
+  L.push(sub2("Calls scavenged:", "0"));
+  L.push(sub2("Storms suppressed:", "0"));
+  L.push("");
+  L.push("   💰 Cost Control");
+  L.push(sub3("Results compacted:", String(compactions.length)));
+  L.push(sub3("Cap (tokens):", "--"));
+  L.push(sub3("Scavenge:", "off"));
+  L.push("");
+  L.push(`   🔄 Turns:  ${user}`);
+  L.push(`   📦 Tokens: ~${totalFmt} total`);
+  L.push("");
+  L.push(priorLine ?? "[prior run] (none yet)");
   return L.join("\n");
 }
+
 
 export default function (pi: ExtensionAPI) {
   if (!ENABLED) return;
@@ -412,7 +440,7 @@ export default function (pi: ExtensionAPI) {
   // most recent one.
   pi.registerCommand("agent-session-status", {
     description:
-      "Show aggregated data from the last agent session (LLM calls, tokens, cost, stop reasons, tools, bash, timeline). Args: `clear` hides the panel, `prev` shows the previous session.",
+      "Show a boxed summary of the last agent session (active model, calls, cache, repairs, cost control, turns, tokens). Args: `clear` hides the panel, `prev` shows the previous session.",
     handler: async (args, ctx) => {
       const a = args.trim();
       if (a === "clear") {
@@ -420,23 +448,27 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const files = findSessionFiles(ctx.sessionManager);
-      // Prefer the newest session file that actually contains messages.
+      // Prefer the newest session files that actually contain messages
+      // (up to 3: current, previous, and the one before — the last two feed
+      // the prior-run footer).
       const withContent: string[] = [];
       for (const f of files) {
         try {
           const entries = parseSessionEntries(readFileSync(f, "utf8"));
           if (entries.some((e) => e.type === "message")) withContent.push(f);
-          if (withContent.length >= 2) break;
+          if (withContent.length >= 3) break;
         } catch {
           /* skip unreadable files */
         }
       }
-      const target = a === "prev" ? withContent[1] : withContent[0];
+      const idx = a === "prev" ? 1 : 0;
+      const target = withContent[idx];
       if (!target) {
         ctx.ui.notify("agent-session-status: no session file with messages found for this project", "warning");
         return;
       }
-      const report = renderReport(target, parseSessionEntries(readFileSync(target, "utf8")));
+      const prior = withContent[idx + 1] ? priorRunLine(withContent[idx + 1]) : undefined;
+      const report = renderReport(target, parseSessionEntries(readFileSync(target, "utf8")), prior);
       if (ctx.hasUI) ctx.ui.setWidget(SESSION_WIDGET_KEY, report.split("\n"));
       else ctx.ui.notify(report, "info");
     },

@@ -1,6 +1,6 @@
 # agent-status
 
-A [pi](https://github.com/earendil-works/pi) extension that shows the agent's live state in the footer, plus a `/agent-session-status` command that reports everything recorded in the last session file.
+A [pi](https://github.com/earendil-works/pi) extension that shows the agent's live state in the footer, plus a `/agent-session-status` command that renders a compact boxed summary of the last session file.
 
 Single-file, zero dependencies, no configuration required — drop it in and `/reload`.
 
@@ -19,13 +19,49 @@ Single-file, zero dependencies, no configuration required — drop it in and `/r
 
 ## Session status report
 
-`/agent-session-status` parses the most recent session file (`~/.pi/agent/sessions/--<cwd>--/*.jsonl`) for the current project and shows an aggregated report as a widget above the editor:
+`/agent-session-status` parses the most recent session file (`~/.pi/agent/sessions/--<cwd>--/*.jsonl`) for the current project and shows a boxed summary as a widget above the editor:
 
-- session id, file, creation time, cwd, fork parent, span + longest idle gap
-- LLM calls, per-model breakdown, token usage (in/out/cacheRead/cacheWrite/reasoning), cost
-- stop reasons, model switches, thinking levels
-- tool calls/results with failure counts, bash commands with exit codes (consecutive repeats collapsed)
-- error messages, compactions, branch summaries, custom/extension events
+```
+╔══════════════════════════════════════════════╗
+║            agent-status Status               ║
+╚══════════════════════════════════════════════╝
+
+   Active:        ✅ Yes (opencode-zen/deepseek-v4-flash-free)
+   Prefix hash:   --
+   Prefix stable: ⏳ --
+   Calls:         26 since last reset
+   Truncations:   0
+
+   📊 Cache
+     Hit tokens:  0
+     Miss tokens: 1,405,468
+     Write tokens: 0
+     Hit ratio:    0.0%
+
+   🔧 Repairs
+     Args repaired:      0
+     Calls scavenged:    0
+     Storms suppressed:  0
+
+   💰 Cost Control
+     Results compacted: 0
+     Cap (tokens):      --
+     Scavenge:          off
+
+   🔄 Turns:  2
+   📦 Tokens: ~1.5M total
+
+[prior run] done · 28 calls · $0.0031
+```
+
+- **Active** — the most-called `provider/model`; `— (no calls yet)` before the first call
+- **Calls / Turns / Tokens** — LLM calls, user turns, and total tokens in this session
+- **Cache** — hit (`cacheRead`), miss (`input`), write (`cacheWrite`) tokens and hit ratio (`-- (no calls yet)` when there are no calls)
+- **Truncations** — assistant messages stopped with `truncated` / `max_tokens`
+- **Repairs** — reserved rows; not tracked by this extension (always `0`)
+- **Cap / Scavenge** — not tracked by this extension (`--` / `off`)
+- **Results compacted** — compaction count from the session file
+- **[prior run]** — the previous session's calls and cost (`(none yet)` if there is no prior session)
 
 | Argument | Effect |
 |----------|--------|
