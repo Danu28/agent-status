@@ -272,9 +272,10 @@ function renderReport(file: string, entries: FileEntry[], priorLine?: string): s
   }
 
   // ── Boxed summary output (pi-reasonix-style layout) ─────────────────────
-  const project = (header?.cwd?.split(/[\\/]/).filter(Boolean).pop() ?? "?") as string;
-  const title = `${project} Status`;
   const W = 46; // inner box width (matches the reference template)
+  const project = (header?.cwd?.split(/[\\/]/).filter(Boolean).pop() ?? "?") as string;
+  // Keep the title inside the box even for very long directory names.
+  const title = `${project} Status`.slice(0, Math.max(1, W - 2));
   const bar = "═".repeat(W);
   const left = Math.max(0, Math.floor((W - title.length) / 2));
   const right = Math.max(0, W - title.length - left);
@@ -327,7 +328,6 @@ function renderReport(file: string, entries: FileEntry[], priorLine?: string): s
   L.push(priorLine ?? "[prior run] (none yet)");
   return L.join("\n");
 }
-
 
 export default function (pi: ExtensionAPI) {
   if (!ENABLED) return;
