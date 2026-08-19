@@ -19,28 +19,26 @@ Single-file, zero dependencies, no configuration required — drop it in and `/r
 
 ## Session status report
 
-`/agent-session-status` parses the most recent session file (`~/.pi/agent/sessions/--<cwd>--/*.jsonl`) for the current project and shows a boxed summary as a widget above the editor. The report is exactly 10 lines — pi renders widgets with a hard 10-line cap and appends `... (widget truncated)` beyond it, so the whole summary always fits:
+`/agent-session-status` parses the most recent session file (`~/.pi/agent/sessions/--<cwd>--/*.jsonl`) for the current project and shows a boxed summary as a widget above the editor. The report is 8 lines — under pi's hard 10-line widget cap (`MAX_WIDGET_LINES`), so the whole summary always fits:
 
 ```
 ╔══════════════════════════════════════════════╗
 ║             agent-status Status              ║
 ╚══════════════════════════════════════════════╝
-   Active:           ✅ Yes (opencode-zen/deepseek-v4-flash-free)
+   Active:           opencode-zen/deepseek-v4-flash-free
    Calls:            69 · truncations 0 · turns 4 · 📦 ~5.2M tokens
-   Prefix:           hash -- · stable ⏳ --
    📊 Cache:         hit 0 · miss 5,052,965 · write 0 · 0.0%
-   🔧 Repairs:       args 0 · scavenged 0 · storms 0
-   💰 Cost:          compacted 0 · cap -- · scavenge off
+   💰 Cost:          $0.0000 · compacted 0
 [prior run] done · 14 calls · $0.0000
 ```
 
 - **Active** — the most-called `provider/model`; `— (no calls yet)` before the first call
 - **Calls** — LLM calls · truncations (`truncated`/`max_tokens` stops) · user turns · total tokens
-- **Prefix** — prefix-cache hash/stable state (not tracked by this extension: `--`)
 - **Cache** — hit (`cacheRead`), miss (`input`), write (`cacheWrite`) tokens and hit ratio
-- **Repairs / Cap / Scavenge** — reserved rows; not tracked by this extension (`0` / `--` / `off`)
-- **compacted** — compaction count from the session file
+- **Cost** — the session's total spend (`usage.cost.total`) · compaction count
 - **[prior run]** — the previous session's calls and cost (`(none yet)` if there is no prior session)
+
+Every field is real data parsed from the session file — no placeholder rows.
 
 | Argument | Effect |
 |----------|--------|

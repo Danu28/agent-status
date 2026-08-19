@@ -30,10 +30,10 @@
  *
  * Also registers the /agent-session-status command: parses the last session
  * file (JSONL) for this project and shows a compact boxed summary as a widget
- * above the editor — active model, calls, truncations, cache hit/miss/write
- * + ratio, repairs, cost control (compactions), turns, total tokens, and the
- * previous run's calls/cost. Run it again to refresh; pass `clear` to hide
- * the panel, `prev` to show the previous session.
+ * above the editor — active model, calls, truncations, turns, total tokens,
+ * cache hit/miss/write + ratio, session cost + compactions, and the previous
+ * run's calls/cost. Run it again to refresh; pass `clear` to hide the panel,
+ * `prev` to show the previous session.
  *
  * Tuning: AGENT_STATUS_STUCK_MS (default 60000). Disable: AGENT_STATUS_ENABLED=0.
  */
@@ -50,9 +50,9 @@ const SHOW_ELAPSED = (process.env.AGENT_STATUS_ELAPSED ?? "1") !== "0";
 const KEY = "agent-status";
 
 // ── /agent-session-status ──────────────────────────────────────────────────
-// Parses the last session JSONL for this project and aggregates the full
-// dataset from the session file: LLM calls + usage/cost, stop reasons, tools,
-// bash commands, errors, compaction, model switches, timeline.
+// Parses the last session JSONL for this project and aggregates the data
+// actually shown in the report: LLM calls + usage/cost, truncations, turns,
+// compaction count.
 const SESSION_WIDGET_KEY = "agent-session-status";
 
 interface UsageAgg {
@@ -68,11 +68,6 @@ interface ModelAgg extends UsageAgg {
   calls: number;
   key: string;
 }
-interface ToolAgg {
-  calls: number;
-  errors: number;
-}
-
 const emptyUsage = (): UsageAgg => ({
   input: 0,
   output: 0,
@@ -84,7 +79,6 @@ const emptyUsage = (): UsageAgg => ({
 });
 
 const fmt = (n: number) => n.toLocaleString("en-US");
-const trunc = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 /** Compact elapsed formatter: 45s, 2m10s, 1h03m20s. */
 const fmtDur = (ms: number): string => {
@@ -133,17 +127,6 @@ function findSessionFiles(sm: SessionInfoLike): string[] {
   return files;
 }
 
-/** Collapse consecutive repeats (e.g. the same gate command run repeatedly). */
-function collapseBash(items: { cmd: string; exit: string }[]): { cmd: string; exit: string; repeats: number }[] {
-  const out: { cmd: string; exit: string; repeats: number }[] = [];
-  for (const it of items) {
-    const last = out[out.length - 1];
-    if (last && last.cmd === it.cmd && last.exit === it.exit) last.repeats++;
-    else out.push({ ...it, repeats: 1 });
-  }
-  return out;
-}
-
 /** One-line footer for the previous session: `[prior run] done · N calls · $X`. */
 function priorRunLine(file: string): string | undefined {
   try {
@@ -165,43 +148,23 @@ function priorRunLine(file: string): string | undefined {
 }
 
 /** Aggregate the session-file dataset and render it as a boxed summary. */
-function renderReport(file: string, entries: FileEntry[], priorLine?: string): string {
+function renderReport(entries: FileEntry[], priorLine?: string): string {
   const header = entries[0] as SessionHeader | undefined;
   const body = entries.slice(1);
 
   const usage: UsageAgg = emptyUsage();
   const models = new Map<string, ModelAgg>();
-  const tools = new Map<string, ToolAgg>();
   const stopReasons = new Map<string, number>();
-  const bash: { cmd: string; exit: string }[] = [];
-  const errors: string[] = [];
   const compactions: number[] = [];
-  const thinking = new Map<string, number>();
-  const custom = new Map<string, number>();
-  const modelChanges: string[] = [];
   let user = 0;
-  let imgs = 0;
   let assistants = 0;
-  let toolCalls = 0;
-  let toolResults = 0;
-  let toolErr = 0;
-  let bashErr = 0;
-  let branch = 0;
-  let lastTs = 0;
-  let maxGap = 0;
 
   for (const e of body) {
-    const t = Date.parse((e as any).timestamp);
-    if (Number.isFinite(t)) {
-      if (lastTs && t - lastTs > maxGap) maxGap = t - lastTs;
-      lastTs = t;
-    }
     if (e.type === "message") {
       const m: any = (e as any).message;
       const role = m?.role;
       if (role === "user") {
         user++;
-        if (Array.isArray(m.content)) imgs += m.content.filter((b: any) => b?.type === "image").length;
       } else if (role === "assistant") {
         assistants++;
         const key = `${m?.provider ?? "?"}/${m?.model ?? "?"}`;
@@ -223,40 +186,9 @@ function renderReport(file: string, entries: FileEntry[], priorLine?: string): s
         }
         const sr = m?.stopReason;
         if (sr) stopReasons.set(sr, (stopReasons.get(sr) ?? 0) + 1);
-        if (Array.isArray(m?.content)) toolCalls += m.content.filter((b: any) => b?.type === "toolCall").length;
-        if (m?.errorMessage) errors.push(`[${m?.model ?? "?"}] ${String(m.errorMessage)}`);
-      } else if (role === "toolResult") {
-        toolResults++;
-        const name = m?.toolName ?? "?";
-        const agg = tools.get(name) ?? { calls: 0, errors: 0 };
-        agg.calls++;
-        if (m?.isError) {
-          agg.errors++;
-          toolErr++;
-        }
-        tools.set(name, agg);
-      } else if (role === "bashExecution") {
-        const code = m?.exitCode;
-        const exit = code === undefined ? "?" : String(code);
-        if (code !== undefined && code !== 0) bashErr++;
-        bash.push({ cmd: String(m?.command ?? ""), exit });
-      } else if (role === "custom") {
-        const ct = m?.customType ?? "?";
-        custom.set(ct, (custom.get(ct) ?? 0) + 1);
       }
-    } else if (e.type === "model_change") {
-      const mc: any = e;
-      modelChanges.push(`${mc.provider}/${mc.modelId}`);
-    } else if (e.type === "thinking_level_change") {
-      const lvl: any = (e as any).thinkingLevel ?? "?";
-      thinking.set(lvl, (thinking.get(lvl) ?? 0) + 1);
     } else if (e.type === "compaction") {
       compactions.push((e as any).tokensBefore ?? 0);
-    } else if (e.type === "branch_summary") {
-      branch++;
-    } else if (e.type === "custom") {
-      const ct = (e as any).customType ?? "?";
-      custom.set(ct, (custom.get(ct) ?? 0) + 1);
     }
   }
 
@@ -271,10 +203,10 @@ function renderReport(file: string, entries: FileEntry[], priorLine?: string): s
     usage.cost += a.cost;
   }
 
-  // ── Boxed summary output (pi-reasonix-style layout) ─────────────────────
+  // ── Boxed summary output ────────────────────────────────────────────────
   // pi renders extension widgets with a hard 10-line cap (MAX_WIDGET_LINES)
-  // and appends "... (widget truncated)" beyond it — keep the report ≤ 10
-  // lines so every field is visible.
+  // and appends "... (widget truncated)" beyond it — the report is 8 lines,
+  // well under the cap, so every field is visible.
   const W = 46; // inner box width (matches the reference template)
   const project = (header?.cwd?.split(/[\\/]/).filter(Boolean).pop() ?? "?") as string;
   // Keep the title inside the box even for very long directory names.
@@ -298,12 +230,10 @@ function renderReport(file: string, entries: FileEntry[], priorLine?: string): s
   const totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite + usage.reasoning;
   const totalFmt = totalTokens >= 1_000_000 ? `${(totalTokens / 1_000_000).toFixed(1)}M` : `${(totalTokens / 1000).toFixed(1)}K`;
 
-  L.push(row("Active:", noCalls ? "— (no calls yet)" : `✅ Yes (${primary.key})`));
+  L.push(row("Active:", noCalls ? "— (no calls yet)" : primary.key));
   L.push(row("Calls:", `${assistants} · truncations ${truncations} · turns ${user} · 📦 ~${totalFmt} tokens`));
-  L.push(row("Prefix:", noCalls ? "hash (no calls yet) · stable ⏳ (no calls yet)" : "hash -- · stable ⏳ --"));
-  L.push(row("📊 Cache:", `hit ${fmt(usage.cacheRead)} · miss ${fmt(usage.input)} · write ${fmt(usage.cacheWrite)} · ${hitRatio === null ? "-- (no calls yet)" : `${hitRatio.toFixed(1)}%`}`));
-  L.push(row("🔧 Repairs:", "args 0 · scavenged 0 · storms 0"));
-  L.push(row("💰 Cost:", `compacted ${compactions.length} · cap -- · scavenge off`));
+  L.push(row("📊 Cache:", `hit ${fmt(usage.cacheRead)} · miss ${fmt(usage.input)} · write ${fmt(usage.cacheWrite)} · ${hitRatio === null ? "--" : `${hitRatio.toFixed(1)}%`}`));
+  L.push(row("💰 Cost:", `$${usage.cost.toFixed(4)} · compacted ${compactions.length}`));
   L.push(priorLine ?? "[prior run] (none yet)");
   return L.join("\n");
 }
@@ -419,7 +349,7 @@ export default function (pi: ExtensionAPI) {
   // most recent one.
   pi.registerCommand("agent-session-status", {
     description:
-      "Show a boxed summary of the last agent session (active model, calls, cache, repairs, cost control, turns, tokens). Args: `clear` hides the panel, `prev` shows the previous session.",
+      "Show a boxed summary of the last agent session (active model, calls, cache, cost, compactions, prior-run calls/cost). Args: `clear` hides the panel, `prev` shows the previous session.",
     handler: async (args, ctx) => {
       const a = args.trim();
       if (a === "clear") {
@@ -447,7 +377,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const prior = withContent[idx + 1] ? priorRunLine(withContent[idx + 1]) : undefined;
-      const report = renderReport(target, parseSessionEntries(readFileSync(target, "utf8")), prior);
+      const report = renderReport(parseSessionEntries(readFileSync(target, "utf8")), prior);
       if (ctx.hasUI) ctx.ui.setWidget(SESSION_WIDGET_KEY, report.split("\n"));
       else ctx.ui.notify(report, "info");
     },
