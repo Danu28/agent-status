@@ -4,3 +4,4 @@ node_modules/
 
 # harness run state
 .harness/
+.auto-agent/

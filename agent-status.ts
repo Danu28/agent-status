@@ -1,7 +1,7 @@
 /**
- * agent-status — footer agent status indicator.
+ * agent-status — footer agent status indicator + /agent-session-status summary.
  *
- * Shows the agent's live state in the footer via `ctx.ui.setStatus()`:
+ * Footer statuses (via ctx.ui.setStatus):
  *   ● running          — agent started, model working (thinking)
  *   ● streaming…       — assistant response streaming
  *   ● running · tool: X — a tool is executing
@@ -12,10 +12,9 @@
  *                        reasoning window — abort only if it never progresses.
  *   ✓ idle             — agent settled; pi is waiting for input
  *
- * Busy statuses also show the wall-clock duration of the current run
- * (e.g. "● running · 2m10s", "● running · tool: X · 45s") so you can see at a
- * glance how long the agent has been working — handy alongside the stuck
- * watchdog when deciding whether to keep waiting or abort.
+ * Busy statuses also append the wall-clock duration of the current run
+ * (e.g. "● running · 2m10s") so you can see at a glance how long the agent has
+ * been working — handy alongside the stuck watchdog.
  *
  * "Activity" = any agent/turn/message/tool event. The watchdog re-checks every
  * 2s and flips to the stuck warning only while the agent is busy.
@@ -24,16 +23,11 @@
  * agent_end alone leaves the badge busy, because pi may auto-retry, compact,
  * or process follow-up messages after it.
  *
- * Note: //reload re-runs this factory; each reload spawns an additional
- * watchdog tick (harmless — renders are cached) but unbounded. A teardown
- * hook is not exposed by the extension API.
- *
  * Also registers the /agent-session-status command: parses the last session
- * file (JSONL) for this project and shows a compact boxed summary as a widget
- * above the editor — active model, calls, truncations, turns, total tokens,
- * cache hit/miss/write + ratio, session cost + compactions, and the previous
- * run's calls/cost. Run it again to refresh; pass `clear` to hide the panel,
- * `prev` to show the previous session.
+ * file (JSONL) for this project and shows a compact summary as a widget above
+ * the editor — active model, calls, turns, total tokens, cache hit/miss/write
+ * + ratio, session cost + compactions. Run it again to refresh; `clear` hides
+ * the panel.
  *
  * Tuning: AGENT_STATUS_STUCK_MS (default 60000). Disable: AGENT_STATUS_ENABLED=0.
  */
@@ -48,40 +42,12 @@ const CHECK_INTERVAL_MS = 2_000;
 const ENABLED = (process.env.AGENT_STATUS_ENABLED ?? "1") !== "0";
 const SHOW_ELAPSED = (process.env.AGENT_STATUS_ELAPSED ?? "1") !== "0";
 const KEY = "agent-status";
-
-// ── /agent-session-status ──────────────────────────────────────────────────
-// Parses the last session JSONL for this project and aggregates the data
-// actually shown in the report: LLM calls + usage/cost, truncations, turns,
-// compaction count.
 const SESSION_WIDGET_KEY = "agent-session-status";
 
-interface UsageAgg {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  reasoning: number;
-  total: number;
-  cost: number;
-}
-interface ModelAgg extends UsageAgg {
-  calls: number;
-  key: string;
-}
-const emptyUsage = (): UsageAgg => ({
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  reasoning: 0,
-  total: 0,
-  cost: 0,
-});
-
-const fmt = (n: number) => n.toLocaleString("en-US");
+// ── pure helpers ──────────────────────────────────────────────────────────
 
 /** Compact elapsed formatter: 45s, 2m10s, 1h03m20s. */
-const fmtDur = (ms: number): string => {
+export const fmtDur = (ms: number): string => {
   const total = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
@@ -91,17 +57,44 @@ const fmtDur = (ms: number): string => {
   return `${s}s`;
 };
 
-/** Session-info access we need from the command context. */
+export type Phase = "thinking" | "streaming" | "tool" | "idle";
+export interface StatusInput {
+  phase: Phase;
+  toolName: string;
+  idleMs: number;
+  stuckMs: number;
+  runStart: number;
+  now: number;
+  showElapsed: boolean;
+}
+
+/** Plain-text footer status for a given state (no theme color applied). */
+export const formatStatus = (s: StatusInput): string => {
+  if (s.phase === "idle") return "✓ idle";
+  let body: string;
+  if (s.idleMs > s.stuckMs) {
+    body =
+      s.phase === "tool"
+        ? `⚠ stuck ${Math.round(s.idleMs / 1000)}s — Esc to abort`
+        : `⚠ no activity ${Math.round(s.idleMs / 1000)}s (may be thinking) — Esc to abort if it never progresses`;
+  } else if (s.phase === "tool") {
+    body = `● running · tool: ${s.toolName}`;
+  } else if (s.phase === "streaming") {
+    body = "● streaming…";
+  } else {
+    body = "● running";
+  }
+  if (s.showElapsed && s.runStart) body += ` · ${fmtDur(s.now - s.runStart)}`;
+  return body;
+};
+
 interface SessionInfoLike {
   getSessionFile?(): string | undefined;
   getSessionDir?(): string;
 }
 
-/**
- * Newest-first session files for this project: the live session first, then
- * the cwd session dir by mtime (deduped).
- */
-function findSessionFiles(sm: SessionInfoLike): string[] {
+/** Newest session file (this project, with ≥1 message), or undefined. */
+export const pickSessionFile = (sm: SessionInfoLike): string | undefined => {
   const candidates: string[] = [];
   const cur = sm.getSessionFile?.();
   if (typeof cur === "string" && cur) candidates.push(cur);
@@ -116,48 +109,46 @@ function findSessionFiles(sm: SessionInfoLike): string[] {
     names.sort((a, b) => statSync(join(dir, b)).mtimeMs - statSync(join(dir, a)).mtimeMs);
     for (const n of names) candidates.push(join(dir, n));
   }
-  const seen = new Set<string>();
-  const files: string[] = [];
   for (const f of candidates) {
-    if (!seen.has(f)) {
-      seen.add(f);
-      files.push(f);
+    try {
+      if (parseSessionEntries(readFileSync(f, "utf8")).some((e) => e.type === "message")) return f;
+    } catch {
+      /* skip unreadable files */
     }
   }
-  return files;
-}
+  return undefined;
+};
 
-/** One-line footer for the previous session: `[prior run] done · N calls · $X`. */
-function priorRunLine(file: string): string | undefined {
-  try {
-    const entries = parseSessionEntries(readFileSync(file, "utf8"));
-    let calls = 0;
-    let cost = 0;
-    for (const e of entries) {
-      if (e.type !== "message") continue;
-      const m: any = (e as any).message;
-      if (m?.role !== "assistant") continue;
-      calls++;
-      cost += m?.usage?.cost?.total ?? 0;
-    }
-    if (calls === 0) return undefined;
-    return `[prior run] done · ${calls} call${calls === 1 ? "" : "s"} · $${cost.toFixed(4)}`;
-  } catch {
-    return undefined;
-  }
+interface UsageAgg {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoning: number;
+  total: number;
+  cost: number;
 }
+const emptyUsage = (): UsageAgg => ({
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  reasoning: 0,
+  total: 0,
+  cost: 0,
+});
+const fmt = (n: number) => n.toLocaleString("en-US");
 
-/** Aggregate the session-file dataset and render it as a boxed summary. */
-function renderReport(entries: FileEntry[], priorLine?: string): string {
+/** Aggregate the session dataset and render a plain multi-line summary. */
+export const renderReport = (entries: FileEntry[]): string => {
   const header = entries[0] as SessionHeader | undefined;
   const body = entries.slice(1);
 
   const usage: UsageAgg = emptyUsage();
-  const models = new Map<string, ModelAgg>();
-  const stopReasons = new Map<string, number>();
-  const compactions: number[] = [];
+  const models = new Map<string, UsageAgg & { calls: number; key: string }>();
   let user = 0;
   let assistants = 0;
+  let compactions = 0;
 
   for (const e of body) {
     if (e.type === "message") {
@@ -184,11 +175,9 @@ function renderReport(entries: FileEntry[], priorLine?: string): string {
           agg.total += u.total ?? 0;
           agg.cost += u.cost?.total ?? 0;
         }
-        const sr = m?.stopReason;
-        if (sr) stopReasons.set(sr, (stopReasons.get(sr) ?? 0) + 1);
       }
     } else if (e.type === "compaction") {
-      compactions.push((e as any).tokensBefore ?? 0);
+      compactions++;
     }
   }
 
@@ -203,53 +192,35 @@ function renderReport(entries: FileEntry[], priorLine?: string): string {
     usage.cost += a.cost;
   }
 
-  // ── Boxed summary output ────────────────────────────────────────────────
-  // pi renders extension widgets with a hard 10-line cap (MAX_WIDGET_LINES)
-  // and appends "... (widget truncated)" beyond it — the report is 8 lines,
-  // well under the cap, so every field is visible.
-  const W = 46; // inner box width (matches the reference template)
   const project = (header?.cwd?.split(/[\\/]/).filter(Boolean).pop() ?? "?") as string;
-  // Keep the title inside the box even for very long directory names.
-  const title = `${project} Status`.slice(0, Math.max(1, W - 2));
-  const bar = "═".repeat(W);
-  const left = Math.max(0, Math.floor((W - title.length) / 2));
-  const right = Math.max(0, W - title.length - left);
-  const L: string[] = [
-    `╔${bar}╗`,
-    `║${' '.repeat(left)}${title}${' '.repeat(right)}║`,
-    `╚${bar}╝`,
-  ];
-  const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - s.length));
-  const row = (label: string, value: string) => `   ${pad(label, 18)}${value}`; // value col 21
-
   const noCalls = assistants === 0;
   const primary = [...models.values()].sort((a, b) => b.calls - a.calls)[0];
-  const truncations = (stopReasons.get("truncated") ?? 0) + (stopReasons.get("max_tokens") ?? 0);
   const hitRatio = usage.cacheRead + usage.input > 0 ? (usage.cacheRead / (usage.cacheRead + usage.input)) * 100 : null;
   // Session usage records don't always carry a `total` — sum the parts.
   const totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite + usage.reasoning;
   const totalFmt = totalTokens >= 1_000_000 ? `${(totalTokens / 1_000_000).toFixed(1)}M` : `${(totalTokens / 1000).toFixed(1)}K`;
 
-  L.push(row("Active:", noCalls ? "— (no calls yet)" : primary.key));
-  L.push(row("Calls:", `${assistants} · truncations ${truncations} · turns ${user} · 📦 ~${totalFmt} tokens`));
-  L.push(row("📊 Cache:", `hit ${fmt(usage.cacheRead)} · miss ${fmt(usage.input)} · write ${fmt(usage.cacheWrite)} · ${hitRatio === null ? "--" : `${hitRatio.toFixed(1)}%`}`));
-  L.push(row("💰 Cost:", `$${usage.cost.toFixed(4)} · compacted ${compactions.length}`));
-  L.push(priorLine ?? "[prior run] (none yet)");
+  const L: string[] = [];
+  L.push(`${project} session`);
+  L.push(`Active:    ${noCalls ? "— (no calls yet)" : primary.key}`);
+  L.push(`Calls:     ${assistants} · turns ${user} · ~${totalFmt} tokens`);
+  L.push(`Cache:     hit ${fmt(usage.cacheRead)} · miss ${fmt(usage.input)} · write ${fmt(usage.cacheWrite)} · ${hitRatio === null ? "--" : `${hitRatio.toFixed(1)}%`}`);
+  L.push(`Cost:      $${usage.cost.toFixed(4)} · compacted ${compactions}`);
   return L.join("\n");
-}
+};
 
 export default function (pi: ExtensionAPI) {
   if (!ENABLED) return;
 
   let ui: any;
-  let phase: "thinking" | "streaming" | "tool" | "idle" = "idle";
+  let phase: Phase = "idle";
   let toolName = "";
   let lastActivity = Date.now();
   let runStart = 0;
   let lastRendered = "";
 
   /** Mark activity; keeps the stuck watchdog from firing. */
-  const touch = (p: typeof phase, tool?: string) => {
+  const touch = (p: Phase, tool?: string) => {
     phase = p;
     if (tool !== undefined) toolName = tool;
     lastActivity = Date.now();
@@ -258,29 +229,19 @@ export default function (pi: ExtensionAPI) {
   const render = () => {
     if (!ui) return;
     const fg = (c: string, t: string) => ui.theme?.fg?.(c, t) ?? t;
-    let s: string;
-    if (phase === "idle") {
-      s = fg("success", "✓") + " idle";
-    } else {
-      const idleMs = Date.now() - lastActivity;
-      if (idleMs > STUCK_MS) {
-        const stuck =
-          phase === "tool"
-            ? `⚠ stuck ${Math.round(idleMs / 1000)}s — Esc to abort`
-            : `⚠ no activity ${Math.round(idleMs / 1000)}s (may be thinking) — Esc to abort if it never progresses`;
-        s = fg("warning", stuck);
-      } else if (phase === "tool") {
-        s = fg("accent", "●") + ` running · tool: ${toolName}`;
-      } else if (phase === "streaming") {
-        s = fg("accent", "●") + " streaming…";
-      } else {
-        s = fg("accent", "●") + " running";
-      }
-      if (SHOW_ELAPSED && runStart) s += ` · ${fmtDur(Date.now() - runStart)}`;
-    }
-    if (s !== lastRendered) {
-      lastRendered = s;
-      ui.setStatus(KEY, s);
+    const s = formatStatus({
+      phase,
+      toolName,
+      idleMs: Date.now() - lastActivity,
+      stuckMs: STUCK_MS,
+      runStart,
+      now: Date.now(),
+      showElapsed: SHOW_ELAPSED,
+    });
+    const colored = s.startsWith("✓") ? fg("success", s) : s.startsWith("⚠") ? fg("warning", s) : fg("accent", s);
+    if (colored !== lastRendered) {
+      lastRendered = colored;
+      ui.setStatus(KEY, colored);
     }
   };
 
@@ -344,40 +305,23 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── /agent-session-status ────────────────────────────────────────────────
-  // Show an aggregated report of the last session as a widget above the editor.
-  // `clear` hides the panel; `prev` shows the previous session instead of the
-  // most recent one.
+  // Show a compact summary of the last session as a widget above the editor.
+  // `clear` hides the panel.
   pi.registerCommand("agent-session-status", {
     description:
-      "Show a boxed summary of the last agent session (active model, calls, cache, cost, compactions, prior-run calls/cost). Args: `clear` hides the panel, `prev` shows the previous session.",
+      "Show a compact summary of the last agent session (active model, calls, cache, cost, compactions). Arg: `clear` hides the panel.",
     handler: async (args, ctx) => {
       const a = args.trim();
       if (a === "clear") {
         ctx.ui.setWidget(SESSION_WIDGET_KEY, undefined);
         return;
       }
-      const files = findSessionFiles(ctx.sessionManager);
-      // Prefer the newest session files that actually contain messages
-      // (up to 3: current, previous, and the one before — the last two feed
-      // the prior-run footer).
-      const withContent: string[] = [];
-      for (const f of files) {
-        try {
-          const entries = parseSessionEntries(readFileSync(f, "utf8"));
-          if (entries.some((e) => e.type === "message")) withContent.push(f);
-          if (withContent.length >= 3) break;
-        } catch {
-          /* skip unreadable files */
-        }
-      }
-      const idx = a === "prev" ? 1 : 0;
-      const target = withContent[idx];
-      if (!target) {
+      const file = pickSessionFile(ctx.sessionManager);
+      if (!file) {
         ctx.ui.notify("agent-session-status: no session file with messages found for this project", "warning");
         return;
       }
-      const prior = withContent[idx + 1] ? priorRunLine(withContent[idx + 1]) : undefined;
-      const report = renderReport(parseSessionEntries(readFileSync(target, "utf8")), prior);
+      const report = renderReport(parseSessionEntries(readFileSync(file, "utf8")));
       if (ctx.hasUI) ctx.ui.setWidget(SESSION_WIDGET_KEY, report.split("\n"));
       else ctx.ui.notify(report, "info");
     },
