@@ -52,6 +52,11 @@ test("formatStatus idle", () => {
   assert.equal(formatStatus({ ...base, phase: "idle" }), "✓ idle");
 });
 
+test("formatStatus idle with last-run ticker persists", () => {
+  assert.equal(formatStatus({ ...base, phase: "idle", ticker: "2 calls · ~5.0K · $0.0100 · 12s" }), "✓ idle · 2 calls · ~5.0K · $0.0100 · 12s");
+  assert.equal(formatStatus({ ...base, phase: "idle", ticker: "1 calls · ~1.0K · $0.0020" }), "✓ idle · 1 calls · ~1.0K · $0.0020");
+});
+
 test("formatStatus running / streaming / tool", () => {
   assert.equal(formatStatus({ ...base, phase: "thinking" }), "● running");
   assert.equal(formatStatus({ ...base, phase: "streaming" }), "● streaming…");
@@ -269,6 +274,57 @@ test("tool_execution_end handler registered and error phase", async () => {
   makeExtension(pi);
   assert.ok(handlers["tool_execution_end"], "tool_execution_end handler exists");
   assert.ok(handlers["agent_settled"], "agent_settled exists");
-  // simulate error tool end should set error phase (cover formatStatus)
   assert.equal(formatStatus({ ...base, phase: "error", toolName: "bash" }), "✖ error · tool: bash");
+});
+
+test("idle persists last-run calls+tokens after settled and resets on new query", async () => {
+  const handlers: Record<string, any> = {};
+  let status = "";
+  const ui: any = {
+    setStatus: (_k: string, v: string) => { status = v; },
+    setWidget() {},
+    notify() {},
+    theme: { fg: (_c: string, t: string) => t },
+  };
+  const live: any[] = [];
+  const header: any = { type: "session", cwd: "/proj", id: "h", timestamp: new Date().toISOString(), version: 3 };
+  const sm: any = {
+    getHeader: () => header,
+    getEntries: () => [...live],
+    getSessionFile: () => undefined,
+    getSessionDir: () => undefined,
+  };
+  const pi: any = { on(ev: string, h: any) { handlers[ev] = h; }, registerCommand() {}, registerShortcut() {} };
+  makeExtension(pi);
+  // first run: snapshot baseline is empty, then one LLM call happens
+  await handlers["agent_start"]({}, { ui, sessionManager: sm });
+  // simulate LLM call added during run
+  live.push({
+    type: "message",
+    id: "m1",
+    parentId: null,
+    timestamp: new Date().toISOString(),
+    message: { role: "assistant", provider: "p", model: "m", usage: { input: 1000, output: 2000, totalTokens: 3000, cost: { total: 0.01 } } },
+  } as any);
+  await handlers["agent_settled"]({}, { ui, sessionManager: sm });
+  // idle should now persist last run
+  assert.match(status, /✓ idle/);
+  assert.match(status, /1 calls/);
+  assert.match(status, /\$0\.0100/);
+  // new query starts -> running should show delta (0 calls since new baseline = 1, so 0)
+  await handlers["agent_start"]({}, { ui, sessionManager: sm });
+  assert.match(status, /● running/);
+  assert.match(status, /0 calls/);
+  // second LLM call
+  live.push({
+    type: "message",
+    id: "m2",
+    parentId: null,
+    timestamp: new Date().toISOString(),
+    message: { role: "assistant", provider: "p", model: "m", usage: { input: 500, output: 500, totalTokens: 1000, cost: { total: 0.005 } } },
+  } as any);
+  await handlers["agent_settled"]({}, { ui, sessionManager: sm });
+  assert.match(status, /✓ idle/);
+  assert.match(status, /1 calls/);
+  assert.match(status, /\$0\.0050/);
 });

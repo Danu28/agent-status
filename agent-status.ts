@@ -75,7 +75,10 @@ export interface StatusInput {
 
 /** Plain-text footer status for a given state (no theme color applied). */
 export const formatStatus = (s: StatusInput): string => {
-  if (s.phase === "idle") return "✓ idle";
+  if (s.phase === "idle") {
+    if (s.ticker) return `✓ idle · ${s.ticker}`;
+    return "✓ idle";
+  }
   if (s.phase === "error") {
     let body = `✖ error · tool: ${s.toolName}`;
     if (s.showElapsed && s.runStart) body += ` · ${fmtDur(s.now - s.runStart)}`;
@@ -367,6 +370,8 @@ export default function (pi: ExtensionAPI) {
   let lastRendered = "";
   let widgetVisible = false;
   let errorTimer: ReturnType<typeof setTimeout> | undefined;
+  let runBaseline: ReportData | null = null;
+  let lastRun: { calls: number; totalTokens: number; totalFmt: string; cost: number; costStr: string; durMs: number } | null = null;
 
   const touch = (p: Phase, tool?: string) => {
     phase = p;
@@ -374,18 +379,39 @@ export default function (pi: ExtensionAPI) {
     lastActivity = Date.now();
   };
 
-  const getTicker = (): string | undefined => {
+  const fmtTokensLocal = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${(n / 1000).toFixed(1)}K`);
+  const snapshotBaseline = (sm: SessionInfoLike | undefined): ReportData | null => {
+    const live = getLiveEntries(sm);
+    if (!live) return null;
+    try {
+      return aggregateEntries(live);
+    } catch {
+      return null;
+    }
+  };
+  const getRunningTicker = (): string | undefined => {
     if (!getShowTicker() || phase === "idle" || !lastSM) return undefined;
     try {
       const live = getLiveEntries(lastSM);
       if (!live) return undefined;
-      const d = aggregateEntries(live);
-      if (d.calls === 0) return undefined;
-      const costStr = Number.isFinite(d.cost) ? d.cost.toFixed(4) : "0.0000";
-      return `~${d.totalFmt} · $${costStr}`;
+      const cur = aggregateEntries(live);
+      if (!runBaseline) {
+        if (cur.calls === 0) return undefined;
+        return `${cur.calls} calls · ~${cur.totalFmt} · $${cur.cost.toFixed(4)}`;
+      }
+      const calls = cur.calls - runBaseline.calls;
+      const tokens = Math.max(0, cur.totalTokens - runBaseline.totalTokens);
+      const cost = Math.max(0, cur.cost - runBaseline.cost);
+      if (calls <= 0 && tokens <= 0 && cost <= 0) return `0 calls · ~0.0K · $0.0000`;
+      return `${Math.max(0, calls)} calls · ~${fmtTokensLocal(tokens)} · $${cost.toFixed(4)}`;
     } catch {
       return undefined;
     }
+  };
+  const getIdleTicker = (): string | undefined => {
+    if (!getShowTicker() || phase !== "idle" || !lastRun) return undefined;
+    const base = `${lastRun.calls} calls · ~${lastRun.totalFmt} · $${lastRun.costStr}`;
+    return getShowElapsed() && lastRun.durMs ? `${base} · ${fmtDur(lastRun.durMs)}` : base;
   };
 
   const render = () => {
@@ -399,7 +425,7 @@ export default function (pi: ExtensionAPI) {
       runStart,
       now: Date.now(),
       showElapsed: getShowElapsed(),
-      ticker: getTicker(),
+      ticker: phase === "idle" ? getIdleTicker() : getRunningTicker(),
     });
     const colored = s.startsWith("✓") ? fg("success", s) : s.startsWith("⚠") || s.startsWith("✖") ? fg("warning", s) : fg("accent", s);
     if (colored !== lastRendered) {
@@ -433,6 +459,7 @@ export default function (pi: ExtensionAPI) {
     ui = ctx.ui;
     lastSM = ctx.sessionManager as any;
     runStart = Date.now();
+    runBaseline = snapshotBaseline(lastSM);
     touch("thinking");
     render();
   });
@@ -514,9 +541,25 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_e, ctx) => {
     ui = ctx.ui;
     lastSM = (ctx as any).sessionManager as any;
+    try {
+      const live = getLiveEntries(lastSM);
+      const cur = live ? aggregateEntries(live) : null;
+      if (cur) {
+        const durMs = runStart ? Date.now() - runStart : 0;
+        if (runBaseline) {
+          const calls = cur.calls - runBaseline.calls;
+          const tokens = Math.max(0, cur.totalTokens - runBaseline.totalTokens);
+          const cost = Math.max(0, cur.cost - runBaseline.cost);
+          if (calls > 0 || tokens > 0 || cost > 0) {
+            lastRun = { calls: Math.max(0, calls), totalTokens: tokens, totalFmt: fmtTokensLocal(tokens), cost, costStr: cost.toFixed(4), durMs };
+          }
+        } else if (cur.calls > 0) {
+          lastRun = { calls: cur.calls, totalTokens: cur.totalTokens, totalFmt: cur.totalFmt, cost: cur.cost, costStr: cur.cost.toFixed(4), durMs };
+        }
+      }
+    } catch {}
     touch("idle");
     render();
-    // auto-refresh widget if visible
     if (widgetVisible) refreshWidget(ctx);
   });
 

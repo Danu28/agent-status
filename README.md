@@ -14,7 +14,8 @@ Single-file, zero dependencies, no configuration required — drop it in and `/r
 | **✖ error · tool: X** | Tool failed (`isError`) — shown briefly, then reverts to thinking |
 | **⚠ no activity Ns** | Busy but no event arrived for `AGENT_STATUS_STUCK_MS` (default 60s). During a tool phase this likely means a hung execution — `Esc` to abort. During thinking/streaming it may just be a long silent reasoning window — abort only if it never progresses. |
 | **✓ idle** | Agent settled; pi is waiting for input |
-| **… · 2m10s · ~18K · $0.0100** | Busy statuses append wall-clock duration and, when enabled, live usage ticker (`~tokens · $cost`) computed from in-memory session entries. |
+| **✓ idle · 2 calls · ~5.0K · $0.0100 · 12s** | Idle persists **last run** stats (calls · tokens · cost · duration) until next query resets it |
+| **… · 2m10s · 2 calls · ~18K · $0.0100** | Busy statuses append wall-clock duration and live **per-run** ticker (calls · tokens · cost); computed as delta from run baseline |
 
 "Activity" = any agent/turn/message/tool event. A watchdog re-checks every 2s and flips to the stuck warning only while the agent is busy.
 
@@ -106,6 +107,8 @@ AGENT_STATUS_TICKER=0 pi          # hide ticker
 
 Subscribes to pi lifecycle events (`agent_start`, `turn_start`, `message_start/update/end`, `tool_execution_start/update/end`, `tool_result`, `agent_end`, `agent_settled`) and renders via `ctx.ui.setStatus()`. Renders are cached (only on change), so the 2s watchdog is harmless.
 
+- **"✓ idle" persists last run** — shows `calls · ~tokens · $cost · duration` from the just-finished run; stays visible through idle; next `agent_start` snapshots a new baseline and running ticker resets to `0 calls`.
+- **Per-run delta, not session total** — running ticker = `current total − baseline at run start`, so you see this task's cost, not lifetime.
 - **"✓ idle"** only on `agent_settled` — `agent_end` alone keeps badge busy (may auto-retry/compact).
 - **`tool_execution_end` + `isError`** handled — error shows `✖ error · tool: X` for 3s.
 - **In-memory first** — `getEntries()/getHeader()` makes `/agent-session-status` instant; disk scan is bounded to 20 newest files as fallback.
