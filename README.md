@@ -1,6 +1,6 @@
 # agent-status
 
-A [pi](https://github.com/earendil-works/pi) extension that shows the agent's live state in the footer, plus a `/agent-session-status` command that renders a compact summary of the last session file.
+A [pi](https://github.com/earendil-works/pi) extension that shows the agent's live state in the footer, plus a `/agent-session-status` command that renders a compact summary of the last session.
 
 Single-file, zero dependencies, no configuration required — drop it in and `/reload`.
 
@@ -11,15 +11,16 @@ Single-file, zero dependencies, no configuration required — drop it in and `/r
 | **● running** | Agent started, model working (thinking) |
 | **● streaming…** | Assistant response streaming |
 | **● running · tool: X** | A tool is executing |
+| **✖ error · tool: X** | Tool failed (`isError`) — shown briefly, then reverts to thinking |
 | **⚠ no activity Ns** | Busy but no event arrived for `AGENT_STATUS_STUCK_MS` (default 60s). During a tool phase this likely means a hung execution — `Esc` to abort. During thinking/streaming it may just be a long silent reasoning window — abort only if it never progresses. |
 | **✓ idle** | Agent settled; pi is waiting for input |
-| **… · 2m10s** | Busy statuses also append the wall-clock duration of the current run, so you can see at a glance how long the agent has been working. |
+| **… · 2m10s · ~18K · $0.0100** | Busy statuses append wall-clock duration and, when enabled, live usage ticker (`~tokens · $cost`) computed from in-memory session entries. |
 
 "Activity" = any agent/turn/message/tool event. A watchdog re-checks every 2s and flips to the stuck warning only while the agent is busy.
 
 ## Session status report
 
-`/agent-session-status` parses the most recent session file (`~/.pi/agent/sessions/--<cwd>--/*.jsonl`) for the current project that contains messages and shows a compact summary as a widget above the editor:
+`/agent-session-status` prefers in-memory entries (`ctx.sessionManager.getEntries()`) for instant reports; falls back to parsing the most recent session file (`~/.pi/agent/sessions/--<cwd>--/*.jsonl`):
 
 ```
 myproj session
@@ -27,51 +28,44 @@ Active:    opencode-zen/deepseek-v4-flash-free
 Calls:     69 · turns 4 · ~5.2M tokens
 Cache:     hit 0 · miss 5,052,965 · write 0 · 0.0%
 Cost:      $0.0000 · compacted 0
+Models:    opencode-zen/deepseek-v4-flash-free (68), other/model (1)
+Tools:     42 ok · 1 err
 ```
 
 - **Active** — the most-called `provider/model`; `— (no calls yet)` before the first call
 - **Calls** — LLM calls · user turns · total tokens
 - **Cache** — hit (`cacheRead`), miss (`input`), write (`cacheWrite`) tokens and hit ratio
-- **Cost** — the session's total spend (`usage.cost.total`) · compaction count
-
-Every field is real data parsed from the session file — no placeholder rows.
+- **Cost** — total spend (`usage.cost.total`) · compaction count
+- **Models** — timeline when multiple models used (sorted by calls)
+- **Tools** — ok/err counts when tool results present
+- **Switches/Branches** — shown when `model_change` / `branch_summary` entries exist
 
 | Argument | Effect |
 |----------|--------|
-| *(none)* | Show the newest session with content (normally the current one) |
+| *(none)* | Show newest session with content (in-memory first, then disk) |
 | `clear` | Hide the panel |
+| `--json` | Output machine-readable JSON (same data, `JSON.stringify`) |
+| `json` | Alias for `--json` |
 
-Re-run the command to refresh the panel. Requires a persisted session (not `--no-session`); with no UI (print/json mode) the report falls back to a notification.
+Re-run the command to refresh; widget auto-refreshes on `agent_settled` while visible. Shortcut `Ctrl+Shift+S` toggles the widget. With no UI (print/json mode) the report falls back to a notification.
 
 ## Install
 
 ### Option A — single file (recommended)
 
-Copy [`agent-status.ts`](agent-status.ts) into pi's global auto-discovery folder:
-
 ```bash
-# curl (or just drop the file in place)
 curl -Lo ~/.pi/agent/extensions/agent-status.ts \
   https://raw.githubusercontent.com/Danu28/agent-status/main/agent-status.ts
-
-# then reload extensions
 /reload
 ```
 
-On Windows, `~` maps to `%USERPROFILE%` → `%USERPROFILE%\.pi\agent\extensions\agent-status.ts`.
-**Prefer a script?** Run `bash ./install.sh` — idempotent: clones/pulls the repo into `~/.pi/agent/.extension-src/` and copies the single file.
-
 ### Dev install — local changes, no push
-
-`install.sh` only ever pulls from GitHub, so it's blind to uncommitted local edits. For active development use **`./dev-install.sh`**, which copies straight from your working tree:
 
 ```bash
 ./dev-install.sh              # copy local agent-status.ts once, then /reload
 ./dev-install.sh --watch      # poll every 1s; re-copy automatically on save
 ./dev-install.sh <path>       # copy a specific file instead of agent-status.ts
 ```
-
-`--watch` compares a checksum each tick and only re-copies on an actual change, so saving the file immediately propagates it into `~/.pi/agent/extensions/agent-status.ts` (run `/reload` once to pick up the new module). Ctrl-C stops it.
 
 ### Option B — whole repo
 
@@ -87,47 +81,43 @@ rm -rf ~/.pi/agent/extensions/agent-status   # optional cleanup
 pi -e ./agent-status.ts
 ```
 
-> **Note:** pi auto-discovers extensions from `~/.pi/agent/extensions/*.ts` (global) or `.pi/extensions/*.ts` (project-local). Extensions can be hot-reloaded with `/reload`; no restart needed. See the [extension docs](https://github.com/earendil-works/pi/blob/main/docs/extensions.md) for details.
+> pi auto-discovers extensions from `~/.pi/agent/extensions/*.ts` (global) or `.pi/extensions/*.ts` (project-local). Hot-reload with `/reload`.
 
 ## Configuration
 
-Environment variables (optional):
+Environment variables (optional, read lazily — works with `/reload`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AGENT_STATUS_STUCK_MS` | `60000` | Milliseconds of silence before the stuck warning appears. `NaN`/`0` fall back to the default; negative values clamp to a 1s floor (`Math.max(1000, …)`) so the watchdog can never be silently disabled. |
-| `AGENT_STATUS_ENABLED` | `1` | Set to `0` to disable the extension entirely. |
-| `AGENT_STATUS_ELAPSED` | `1` | Set to `0` to hide the running-session duration appended to busy statuses. |
+| `AGENT_STATUS_STUCK_MS` | `60000` | Ms of silence before stuck warning. `NaN`/`0` fallback to default; clamped to 1s floor. |
+| `AGENT_STATUS_ENABLED` | `1` | `0` disables extension entirely. |
+| `AGENT_STATUS_ELAPSED` | `1` | `0` hides running-session duration. |
+| `AGENT_STATUS_TICKER` | `1` | `0` hides live `~tokens · $cost` ticker. |
 
 ```bash
-AGENT_STATUS_STUCK_MS=120000 pi          # quieter watchdog (120s)
-AGENT_STATUS_ENABLED=0 pi                # disable
-AGENT_STATUS_ELAPSED=0 pi                # hide the running-session timer
+AGENT_STATUS_STUCK_MS=120000 pi   # quieter watchdog
+AGENT_STATUS_ENABLED=0 pi         # disable
+AGENT_STATUS_ELAPSED=0 pi         # hide timer
+AGENT_STATUS_TICKER=0 pi          # hide ticker
 ```
 
 ## How it works
 
-The extension subscribes to pi's lifecycle events (`agent_start`, `turn_start`, `message_start/update/end`, `tool_execution_start`, `tool_result`, `agent_end`, `agent_settled`) and renders the status via `ctx.ui.setStatus()`. Because renders are cached (only re-render on change), the 2s watchdog interval is harmless.
+Subscribes to pi lifecycle events (`agent_start`, `turn_start`, `message_start/update/end`, `tool_execution_start/update/end`, `tool_result`, `agent_end`, `agent_settled`) and renders via `ctx.ui.setStatus()`. Renders are cached (only on change), so the 2s watchdog is harmless.
 
-Design notes worth knowing:
-
-- **"✓ idle"** is set only on `agent_settled` — `agent_end` alone leaves the badge busy, because pi may auto-retry, compact, or process follow-up messages after it.
-- **`//reload` re-runs the factory**; each reload spawns an additional watchdog tick (harmless — renders are cached). A teardown hook isn't exposed by the extension API.
-- **Malformed env values are clamped** — the watchdog can never be silently disabled by a bad `AGENT_STATUS_STUCK_MS`.
+- **"✓ idle"** only on `agent_settled` — `agent_end` alone keeps badge busy (may auto-retry/compact).
+- **`tool_execution_end` + `isError`** handled — error shows `✖ error · tool: X` for 3s.
+- **In-memory first** — `getEntries()/getHeader()` makes `/agent-session-status` instant; disk scan is bounded to 20 newest files as fallback.
+- **Singleton interval** — `globalThis.__agentStatusInterval` is cleared on `/reload`, so no leak.
+- **Lazy env** — `process.env` re-read on each render; tuning works with `/reload`, not just restart.
+- **Shortcut** — `Ctrl+Shift+S` toggles the widget.
 
 ## Development
 
-The repo includes TypeScript scaffolding so you can type-check locally:
-
 ```bash
-npm install    # dev deps only: pi types, typescript, @types/node
+npm install
 npm run typecheck
-```
-
-Tests (Node 24 runs `.ts` natively):
-
-```bash
-node --test test/
+node --test
 ```
 
 ## License

@@ -11,38 +11,41 @@
  *                        thinking/streaming it may just be a long silent
  *                        reasoning window — abort only if it never progresses.
  *   ✓ idle             — agent settled; pi is waiting for input
+ *   ✖ error · tool: X  — tool failed (shown briefly after isError)
  *
- * Busy statuses also append the wall-clock duration of the current run
- * (e.g. "● running · 2m10s") so you can see at a glance how long the agent has
- * been working — handy alongside the stuck watchdog.
+ * Busy statuses append wall-clock duration (e.g. "● running · 2m10s") and,
+ * when enabled, live usage ticker (e.g. "· ~18K · $0.01").
  *
  * "Activity" = any agent/turn/message/tool event. The watchdog re-checks every
  * 2s and flips to the stuck warning only while the agent is busy.
  *
- * "✓ idle" is set only on agent_settled (pi will not continue on its own);
- * agent_end alone leaves the badge busy, because pi may auto-retry, compact,
- * or process follow-up messages after it.
+ * "✓ idle" is set only on agent_settled; agent_end alone leaves badge busy,
+ * because pi may auto-retry, compact, or process follow-up messages after it.
  *
- * Also registers the /agent-session-status command: parses the last session
- * file (JSONL) for this project and shows a compact summary as a widget above
- * the editor — active model, calls, turns, total tokens, cache hit/miss/write
- * + ratio, session cost + compactions. Run it again to refresh; `clear` hides
- * the panel.
+ * Also registers the /agent-session-status command: prefers in-memory
+ * session entries (ctx.sessionManager.getEntries()) for instant reports; falls
+ * back to parsing the most recent session file (JSONL) for this project.
+ * Shows compact summary as widget above editor — active model, calls, turns,
+ * total tokens, cache hit/miss/write + ratio, cost + compactions (+ tool
+ * stats / model timeline when present). Supports `clear` and `--json`.
  *
- * Tuning: AGENT_STATUS_STUCK_MS (default 60000). Disable: AGENT_STATUS_ENABLED=0.
+ * Tuning: AGENT_STATUS_STUCK_MS (default 60000), AGENT_STATUS_ELAPSED (1/0),
+ * AGENT_STATUS_TICKER (1/0), AGENT_STATUS_ENABLED (1/0).
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parseSessionEntries, type ExtensionAPI, type FileEntry, type SessionHeader } from "@earendil-works/pi-coding-agent";
 
-// Clamp bad env values: NaN/0/negative fall back to the default; the watchdog
-// can never be silently disabled by a malformed AGENT_STATUS_STUCK_MS.
-const STUCK_MS = Math.max(1_000, Number(process.env.AGENT_STATUS_STUCK_MS) || 60_000);
+// ── env helpers (lazy, clamped) ───────────────────────────────────────────
+const getStuckMs = () => Math.max(1_000, Number(process.env.AGENT_STATUS_STUCK_MS) || 60_000);
+const getShowElapsed = () => (process.env.AGENT_STATUS_ELAPSED ?? "1") !== "0";
+const getShowTicker = () => (process.env.AGENT_STATUS_TICKER ?? "1") !== "0";
+const isEnabled = () => (process.env.AGENT_STATUS_ENABLED ?? "1") !== "0";
+
 const CHECK_INTERVAL_MS = 2_000;
-const ENABLED = (process.env.AGENT_STATUS_ENABLED ?? "1") !== "0";
-const SHOW_ELAPSED = (process.env.AGENT_STATUS_ELAPSED ?? "1") !== "0";
 const KEY = "agent-status";
 const SESSION_WIDGET_KEY = "agent-session-status";
+const PICK_LIMIT = 20;
 
 // ── pure helpers ──────────────────────────────────────────────────────────
 
@@ -57,7 +60,7 @@ export const fmtDur = (ms: number): string => {
   return `${s}s`;
 };
 
-export type Phase = "thinking" | "streaming" | "tool" | "idle";
+export type Phase = "thinking" | "streaming" | "tool" | "idle" | "error";
 export interface StatusInput {
   phase: Phase;
   toolName: string;
@@ -66,11 +69,18 @@ export interface StatusInput {
   runStart: number;
   now: number;
   showElapsed: boolean;
+  ticker?: string;
 }
 
 /** Plain-text footer status for a given state (no theme color applied). */
 export const formatStatus = (s: StatusInput): string => {
   if (s.phase === "idle") return "✓ idle";
+  if (s.phase === "error") {
+    let body = `✖ error · tool: ${s.toolName}`;
+    if (s.showElapsed && s.runStart) body += ` · ${fmtDur(s.now - s.runStart)}`;
+    if (s.ticker) body += ` · ${s.ticker}`;
+    return body;
+  }
   let body: string;
   if (s.idleMs > s.stuckMs) {
     body =
@@ -85,19 +95,26 @@ export const formatStatus = (s: StatusInput): string => {
     body = "● running";
   }
   if (s.showElapsed && s.runStart) body += ` · ${fmtDur(s.now - s.runStart)}`;
+  if (s.ticker) body += ` · ${s.ticker}`;
   return body;
 };
 
 interface SessionInfoLike {
   getSessionFile?(): string | undefined;
   getSessionDir?(): string;
+  getEntries?(): FileEntry[];
+  getHeader?(): SessionHeader | null;
 }
 
-/** Newest session file (this project, with ≥1 message), or undefined. */
+/** Newest session file (this project, with ≥1 message), or undefined. Bounded to PICK_LIMIT. */
 export const pickSessionFile = (sm: SessionInfoLike): string | undefined => {
   const candidates: string[] = [];
+  const seen = new Set<string>();
   const cur = sm.getSessionFile?.();
-  if (typeof cur === "string" && cur) candidates.push(cur);
+  if (typeof cur === "string" && cur) {
+    candidates.push(cur);
+    seen.add(cur);
+  }
   const dir = sm.getSessionDir?.();
   if (dir) {
     let names: string[] = [];
@@ -106,8 +123,21 @@ export const pickSessionFile = (sm: SessionInfoLike): string | undefined => {
     } catch {
       /* no session dir yet */
     }
-    names.sort((a, b) => statSync(join(dir, b)).mtimeMs - statSync(join(dir, a)).mtimeMs);
-    for (const n of names) candidates.push(join(dir, n));
+    names.sort((a, b) => {
+      try {
+        return statSync(join(dir, b)).mtimeMs - statSync(join(dir, a)).mtimeMs;
+      } catch {
+        return 0;
+      }
+    });
+    const limited = names.slice(0, PICK_LIMIT);
+    for (const n of limited) {
+      const p = join(dir, n);
+      if (!seen.has(p)) {
+        candidates.push(p);
+        seen.add(p);
+      }
+    }
   }
   for (const f of candidates) {
     try {
@@ -124,7 +154,6 @@ interface UsageAgg {
   output: number;
   cacheRead: number;
   cacheWrite: number;
-  reasoning: number;
   total: number;
   cost: number;
 }
@@ -133,25 +162,49 @@ const emptyUsage = (): UsageAgg => ({
   output: 0,
   cacheRead: 0,
   cacheWrite: 0,
-  reasoning: 0,
   total: 0,
   cost: 0,
 });
 const fmt = (n: number) => n.toLocaleString("en-US");
 
-/** Aggregate the session dataset and render a plain multi-line summary. */
-export const renderReport = (entries: FileEntry[]): string => {
-  const header = entries[0] as SessionHeader | undefined;
-  const body = entries.slice(1);
+interface ReportData {
+  project: string;
+  active: string | null;
+  calls: number;
+  turns: number;
+  totalTokens: number;
+  totalFmt: string;
+  cacheRead: number;
+  cacheWrite: number;
+  cacheInput: number;
+  hitRatio: number | null;
+  cost: number;
+  compactions: number;
+  branchSummaries: number;
+  modelChanges: number;
+  models: { key: string; calls: number; input: number; output: number; cacheRead: number; cacheWrite: number; total: number; cost: number }[];
+  toolOk: number;
+  toolErr: number;
+}
+
+export const aggregateEntries = (entries: FileEntry[]): ReportData => {
+  // ponytail: O(n) scan, single pass. Good enough for <10k entries; if sessions grow huge, cache by entries.length.
+  const header = entries.find((e) => (e as any).type === "session" || (e as any).type === "header") as SessionHeader | undefined;
+  const body = entries.filter((e) => (e as any).type !== "session" && (e as any).type !== "header");
 
   const usage: UsageAgg = emptyUsage();
   const models = new Map<string, UsageAgg & { calls: number; key: string }>();
   let user = 0;
   let assistants = 0;
   let compactions = 0;
+  let branchSummaries = 0;
+  let modelChanges = 0;
+  let toolOk = 0;
+  let toolErr = 0;
 
   for (const e of body) {
-    if (e.type === "message") {
+    const t = (e as any).type;
+    if (t === "message") {
       const m: any = (e as any).message;
       const role = m?.role;
       if (role === "user") {
@@ -167,63 +220,171 @@ export const renderReport = (entries: FileEntry[]): string => {
         agg.calls++;
         const u: any = m?.usage;
         if (u) {
-          agg.input += u.input ?? 0;
-          agg.output += u.output ?? 0;
-          agg.cacheRead += u.cacheRead ?? 0;
-          agg.cacheWrite += u.cacheWrite ?? 0;
-          agg.reasoning += u.reasoning ?? 0;
-          agg.total += u.total ?? 0;
-          agg.cost += u.cost?.total ?? 0;
+          agg.input += Number(u.input ?? 0);
+          agg.output += Number(u.output ?? 0);
+          agg.cacheRead += Number(u.cacheRead ?? 0);
+          agg.cacheWrite += Number(u.cacheWrite ?? 0);
+          agg.total += Number(u.totalTokens ?? 0);
+          agg.cost += Number(u.cost?.total ?? 0);
         }
+        // tool stats embedded in assistant message (toolCalls)
+        if (Array.isArray(m?.toolCalls)) {
+          for (const tc of m.toolCalls) {
+            // count as pending; result counted via tool message
+            void tc;
+          }
+        }
+      } else if (role === "tool") {
+        // tool result stored as tool-role message
+        const isErr = (m as any)?.isError ?? (m as any)?.error ?? false;
+        if (isErr) toolErr++;
+        else toolOk++;
       }
-    } else if (e.type === "compaction") {
+    } else if (t === "compaction") {
       compactions++;
+      const u: any = (e as any).usage;
+      if (u) toolOk += 0; // no-op, keep structure
+    } else if (t === "branch_summary") {
+      branchSummaries++;
+    } else if (t === "model_change") {
+      modelChanges++;
+    } else if (t === "tool_result" || t === "tool_call") {
+      // some pi versions store tool events as custom entries
+      const isErr = (e as any).isError ?? false;
+      if (isErr) toolErr++;
+      else toolOk++;
     }
   }
 
-  // Global usage = sum over per-model aggregates (single accumulation point).
   for (const a of models.values()) {
     usage.input += a.input;
     usage.output += a.output;
     usage.cacheRead += a.cacheRead;
     usage.cacheWrite += a.cacheWrite;
-    usage.reasoning += a.reasoning;
     usage.total += a.total;
     usage.cost += a.cost;
   }
 
   const project = (header?.cwd?.split(/[\\/]/).filter(Boolean).pop() ?? "?") as string;
-  const noCalls = assistants === 0;
   const primary = [...models.values()].sort((a, b) => b.calls - a.calls)[0];
   const hitRatio = usage.cacheRead + usage.input > 0 ? (usage.cacheRead / (usage.cacheRead + usage.input)) * 100 : null;
-  // Session usage records don't always carry a `total` — sum the parts.
-  const totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite + usage.reasoning;
+  const totalTokens = usage.total > 0 ? usage.total : usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
   const totalFmt = totalTokens >= 1_000_000 ? `${(totalTokens / 1_000_000).toFixed(1)}M` : `${(totalTokens / 1000).toFixed(1)}K`;
 
+  return {
+    project,
+    active: assistants === 0 ? null : primary?.key ?? null,
+    calls: assistants,
+    turns: user,
+    totalTokens,
+    totalFmt,
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    cacheInput: usage.input,
+    hitRatio,
+    cost: Number(usage.cost ?? 0),
+    compactions,
+    branchSummaries,
+    modelChanges,
+    models: [...models.values()].map((m) => ({ key: m.key, calls: m.calls, input: m.input, output: m.output, cacheRead: m.cacheRead, cacheWrite: m.cacheWrite, total: m.total, cost: Number(m.cost ?? 0) })),
+    toolOk,
+    toolErr,
+  };
+};
+
+/** Aggregate the session dataset and render a plain multi-line summary. */
+export const renderReport = (entries: FileEntry[]): string => {
+  const d = aggregateEntries(entries);
+  const noCalls = d.calls === 0;
   const L: string[] = [];
-  L.push(`${project} session`);
-  L.push(`Active:    ${noCalls ? "— (no calls yet)" : primary.key}`);
-  L.push(`Calls:     ${assistants} · turns ${user} · ~${totalFmt} tokens`);
-  L.push(`Cache:     hit ${fmt(usage.cacheRead)} · miss ${fmt(usage.input)} · write ${fmt(usage.cacheWrite)} · ${hitRatio === null ? "--" : `${hitRatio.toFixed(1)}%`}`);
-  L.push(`Cost:      $${usage.cost.toFixed(4)} · compacted ${compactions}`);
+  L.push(`${d.project} session`);
+  L.push(`Active:    ${noCalls ? "— (no calls yet)" : d.active}`);
+  L.push(`Calls:     ${d.calls} · turns ${d.turns} · ~${d.totalFmt} tokens`);
+  L.push(`Cache:     hit ${fmt(d.cacheRead)} · miss ${fmt(d.cacheInput)} · write ${fmt(d.cacheWrite)} · ${d.hitRatio === null ? "--" : `${d.hitRatio.toFixed(1)}%`}`);
+  const costStr = Number.isFinite(d.cost) ? d.cost.toFixed(4) : "0.0000";
+  L.push(`Cost:      $${costStr} · compacted ${d.compactions}`);
+  if (d.models.length > 1) {
+    const timeline = d.models
+      .sort((a, b) => b.calls - a.calls)
+      .map((m) => `${m.key} (${m.calls})`)
+      .join(", ");
+    L.push(`Models:    ${timeline}`);
+  }
+  if (d.modelChanges > 0) L.push(`Switches:  ${d.modelChanges} model change(s)`);
+  if (d.branchSummaries > 0) L.push(`Branches:  ${d.branchSummaries} branch summar${d.branchSummaries === 1 ? "y" : "ies"}`);
+  if (d.toolOk + d.toolErr > 0) L.push(`Tools:     ${d.toolOk} ok · ${d.toolErr} err`);
   return L.join("\n");
 };
 
+export const buildReportJson = (entries: FileEntry[]): Record<string, unknown> => {
+  const d = aggregateEntries(entries);
+  return {
+    project: d.project,
+    activeModel: d.active,
+    calls: d.calls,
+    turns: d.turns,
+    totalTokens: d.totalTokens,
+    totalFmt: d.totalFmt,
+    cache: { hit: d.cacheRead, miss: d.cacheInput, write: d.cacheWrite, hitRatio: d.hitRatio },
+    cost: d.cost,
+    compactions: d.compactions,
+    branchSummaries: d.branchSummaries,
+    modelChanges: d.modelChanges,
+    tools: { ok: d.toolOk, err: d.toolErr },
+    models: d.models,
+  };
+};
+
+const getLiveEntries = (sm: SessionInfoLike | undefined): FileEntry[] | null => {
+  try {
+    const anySm = sm as any;
+    if (anySm?.getEntries && anySm?.getHeader) {
+      const h = anySm.getHeader();
+      const ents: FileEntry[] = anySm.getEntries();
+      if (!ents || ents.length === 0) return null;
+      const out: FileEntry[] = [];
+      if (h) out.push(h);
+      out.push(...ents);
+      // require at least one message to be considered valid
+      if (out.some((e) => (e as any).type === "message")) return out;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+};
+
 export default function (pi: ExtensionAPI) {
-  if (!ENABLED) return;
+  if (!isEnabled()) return;
 
   let ui: any;
+  let lastSM: SessionInfoLike | undefined;
   let phase: Phase = "idle";
   let toolName = "";
   let lastActivity = Date.now();
   let runStart = 0;
   let lastRendered = "";
+  let widgetVisible = false;
+  let errorTimer: ReturnType<typeof setTimeout> | undefined;
 
-  /** Mark activity; keeps the stuck watchdog from firing. */
   const touch = (p: Phase, tool?: string) => {
     phase = p;
     if (tool !== undefined) toolName = tool;
     lastActivity = Date.now();
+  };
+
+  const getTicker = (): string | undefined => {
+    if (!getShowTicker() || phase === "idle" || !lastSM) return undefined;
+    try {
+      const live = getLiveEntries(lastSM);
+      if (!live) return undefined;
+      const d = aggregateEntries(live);
+      if (d.calls === 0) return undefined;
+      const costStr = Number.isFinite(d.cost) ? d.cost.toFixed(4) : "0.0000";
+      return `~${d.totalFmt} · $${costStr}`;
+    } catch {
+      return undefined;
+    }
   };
 
   const render = () => {
@@ -233,101 +394,205 @@ export default function (pi: ExtensionAPI) {
       phase,
       toolName,
       idleMs: Date.now() - lastActivity,
-      stuckMs: STUCK_MS,
+      stuckMs: getStuckMs(),
       runStart,
       now: Date.now(),
-      showElapsed: SHOW_ELAPSED,
+      showElapsed: getShowElapsed(),
+      ticker: getTicker(),
     });
-    const colored = s.startsWith("✓") ? fg("success", s) : s.startsWith("⚠") ? fg("warning", s) : fg("accent", s);
+    const colored = s.startsWith("✓") ? fg("success", s) : s.startsWith("⚠") || s.startsWith("✖") ? fg("warning", s) : fg("accent", s);
     if (colored !== lastRendered) {
       lastRendered = colored;
       ui.setStatus(KEY, colored);
     }
   };
 
+  const refreshWidget = async (ctx: any) => {
+    if (!widgetVisible) return;
+    // prefer live entries
+    const live = getLiveEntries(ctx.sessionManager ?? lastSM);
+    if (live) {
+      const report = renderReport(live);
+      if (ctx.hasUI) ctx.ui.setWidget(SESSION_WIDGET_KEY, report.split("\n"));
+      else ctx.ui.notify(report, "info");
+      return;
+    }
+    const file = pickSessionFile(ctx.sessionManager ?? ({} as any));
+    if (!file) return;
+    try {
+      const report = renderReport(parseSessionEntries(readFileSync(file, "utf8")));
+      if (ctx.hasUI) ctx.ui.setWidget(SESSION_WIDGET_KEY, report.split("\n"));
+      else ctx.ui.notify(report, "info");
+    } catch {
+      /* ignore */
+    }
+  };
+
   pi.on("agent_start", async (_e, ctx) => {
     ui = ctx.ui;
+    lastSM = ctx.sessionManager as any;
     runStart = Date.now();
     touch("thinking");
     render();
   });
   pi.on("turn_start", async (_e, ctx) => {
     ui = ctx.ui;
+    lastSM = ctx.sessionManager as any;
     touch("thinking");
     render();
   });
   pi.on("message_start", async (e, ctx) => {
     ui = ctx.ui;
-    // Only assistant messages stream; user/toolResult messages fire
-    // message_start too and would flash "streaming…" before reverting.
+    lastSM = (ctx as any).sessionManager as any;
     if ((e as any)?.message?.role !== "assistant") return;
     touch("streaming");
     render();
   });
-  // Fires per streaming delta — just refresh the activity timestamp, render
-  // happens on the next non-delta event / watchdog tick.
   pi.on("message_update", async (_e, ctx) => {
     ui = ctx.ui;
+    lastSM = (ctx as any).sessionManager as any;
     touch("streaming");
   });
   pi.on("message_end", async (_e, ctx) => {
     ui = ctx.ui;
+    lastSM = (ctx as any).sessionManager as any;
     touch("thinking");
     render();
   });
   pi.on("tool_execution_start", async (e, ctx) => {
     ui = ctx.ui;
-    touch("tool", e?.toolName ?? "?");
+    lastSM = (ctx as any).sessionManager as any;
+    touch("tool", (e as any)?.toolName ?? "?");
     render();
+  });
+  pi.on("tool_execution_update", async (e, ctx) => {
+    ui = ctx.ui;
+    lastSM = (ctx as any).sessionManager as any;
+    touch("tool", (e as any)?.toolName ?? "?");
   });
   pi.on("tool_result", async (_e, ctx) => {
     ui = ctx.ui;
+    lastSM = (ctx as any).sessionManager as any;
+    if (phase === "error") return; // keep error visible briefly
     touch("thinking");
     render();
   });
+  pi.on("tool_execution_end", async (e, ctx) => {
+    ui = ctx.ui;
+    lastSM = (ctx as any).sessionManager as any;
+    const isErr = !!(e as any)?.isError;
+    const name = (e as any)?.toolName ?? "?";
+    if (isErr) {
+      touch("error", name);
+      render();
+      if (errorTimer) clearTimeout(errorTimer);
+      errorTimer = setTimeout(() => {
+        if (phase === "error") {
+          touch("thinking");
+          render();
+        }
+      }, 3000);
+    } else {
+      if (phase === "error") return;
+      touch("thinking");
+      render();
+    }
+  });
   pi.on("turn_end", async (_e, ctx) => {
     ui = ctx.ui;
+    lastSM = (ctx as any).sessionManager as any;
     touch("thinking");
   });
   pi.on("agent_end", async (_e, ctx) => {
     ui = ctx.ui;
-    // The run ended, but pi may still auto-retry, compact+retry, or process
-    // queued follow-ups — keep the badge busy until agent_settled. If
-    // agent_settled were ever skipped on a path, the footer would stay
-    // "running" (conservative, watchdog-covered) instead of lying "idle".
+    lastSM = (ctx as any).sessionManager as any;
+    if (phase === "error") return;
     touch("thinking");
     render();
   });
   pi.on("agent_settled", async (_e, ctx) => {
     ui = ctx.ui;
+    lastSM = (ctx as any).sessionManager as any;
     touch("idle");
     render();
+    // auto-refresh widget if visible
+    if (widgetVisible) refreshWidget(ctx);
   });
 
   // ── /agent-session-status ────────────────────────────────────────────────
-  // Show a compact summary of the last session as a widget above the editor.
-  // `clear` hides the panel.
   pi.registerCommand("agent-session-status", {
     description:
-      "Show a compact summary of the last agent session (active model, calls, cache, cost, compactions). Arg: `clear` hides the panel.",
+      "Show a compact summary of the last agent session (active model, calls, cache, cost, compactions). Args: `clear` hides the panel, `--json` outputs JSON.",
     handler: async (args, ctx) => {
       const a = args.trim();
       if (a === "clear") {
         ctx.ui.setWidget(SESSION_WIDGET_KEY, undefined);
+        widgetVisible = false;
         return;
       }
-      const file = pickSessionFile(ctx.sessionManager);
-      if (!file) {
-        ctx.ui.notify("agent-session-status: no session file with messages found for this project", "warning");
+      const isJson = a === "--json" || a === "json" || a.includes("--json");
+      // prefer in-memory live entries (instant, no FS)
+      let entries: FileEntry[] | null = getLiveEntries(ctx.sessionManager as any);
+      if (!entries) {
+        const file = pickSessionFile(ctx.sessionManager);
+        if (!file) {
+          ctx.ui.notify("agent-session-status: no session file with messages found for this project", "warning");
+          return;
+        }
+        try {
+          entries = parseSessionEntries(readFileSync(file, "utf8"));
+        } catch {
+          ctx.ui.notify("agent-session-status: failed to read session file", "warning");
+          return;
+        }
+      }
+      if (isJson) {
+        const j = buildReportJson(entries);
+        const pretty = JSON.stringify(j, null, 2);
+        if (ctx.hasUI) {
+          ctx.ui.setWidget(SESSION_WIDGET_KEY, pretty.split("\n"));
+          widgetVisible = true;
+        } else ctx.ui.notify(pretty, "info");
         return;
       }
-      const report = renderReport(parseSessionEntries(readFileSync(file, "utf8")));
-      if (ctx.hasUI) ctx.ui.setWidget(SESSION_WIDGET_KEY, report.split("\n"));
-      else ctx.ui.notify(report, "info");
+      const report = renderReport(entries);
+      if (ctx.hasUI) {
+        ctx.ui.setWidget(SESSION_WIDGET_KEY, report.split("\n"));
+        widgetVisible = true;
+      } else ctx.ui.notify(report, "info");
     },
   });
 
-  // Stuck watchdog: re-render every few seconds so the warning appears when
-  // activity stops while the agent is supposedly running.
-  setInterval(render, CHECK_INTERVAL_MS);
+  // keyboard shortcut to toggle widget
+  try {
+    pi.registerShortcut("ctrl+shift+s", {
+      description: "Toggle agent session status widget",
+      handler: async (ctx: any) => {
+        if (widgetVisible) {
+          ctx.ui.setWidget(SESSION_WIDGET_KEY, undefined);
+          widgetVisible = false;
+        } else {
+          let entries: FileEntry[] | null = getLiveEntries(ctx.sessionManager as any ?? lastSM);
+          if (!entries) {
+            const file = pickSessionFile((ctx.sessionManager as any) ?? lastSM ?? ({} as any));
+            if (!file) {
+              ctx.ui.notify("agent-session-status: no session found", "warning");
+              return;
+            }
+            entries = parseSessionEntries(readFileSync(file, "utf8"));
+          }
+          const report = renderReport(entries);
+          ctx.ui.setWidget(SESSION_WIDGET_KEY, report.split("\n"));
+          widgetVisible = true;
+        }
+      },
+    });
+  } catch {
+    /* shortcut not supported on this pi version */
+  }
+
+  // Stuck watchdog: singleton so /reload doesn't leak intervals
+  const g = globalThis as any;
+  if (g.__agentStatusInterval) clearInterval(g.__agentStatusInterval);
+  g.__agentStatusInterval = setInterval(render, CHECK_INTERVAL_MS);
 }
