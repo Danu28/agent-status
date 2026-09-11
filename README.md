@@ -47,7 +47,7 @@ Tools:     42 ok · 1 err
 | `--json` | Output machine-readable JSON (same data, `JSON.stringify`) |
 | `json` | Alias for `--json` |
 
-Re-run the command to refresh; widget auto-refreshes on `agent_settled` while visible. Shortcut `Ctrl+Shift+S` toggles the widget. With no UI (print/json mode) the report falls back to a notification.
+Re-run the command to refresh; widget auto-refreshes on `agent_settled` while visible. Shortcut `Ctrl+Shift+A` (configurable via `AGENT_STATUS_SHORTCUT`) toggles the widget. With no UI (print/json mode) the report falls back to a notification. Default was `Ctrl+Shift+S` until v1.0.1 — changed to avoid conflict with `pi-web-access` (`curate` shortcut).
 
 ## Install
 
@@ -93,6 +93,7 @@ Environment variables (optional, read lazily — works with `/reload`):
 | `AGENT_STATUS_ENABLED` | `1` | `0` disables extension entirely. |
 | `AGENT_STATUS_ELAPSED` | `1` | `0` hides running-session duration. |
 | `AGENT_STATUS_TICKER` | `1` | `0` hides live `~tokens · $cost` ticker. |
+| `AGENT_STATUS_SHORTCUT` | `ctrl+shift+a` | Shortcut to toggle widget. Was `ctrl+shift+s` — changed to avoid conflict with `pi-web-access` (`ctrl+shift+s` curate). |
 
 ```bash
 AGENT_STATUS_STUCK_MS=120000 pi   # quieter watchdog
@@ -110,7 +111,7 @@ Subscribes to pi lifecycle events (`agent_start`, `turn_start`, `message_start/u
 - **In-memory first** — `getEntries()/getHeader()` makes `/agent-session-status` instant; disk scan is bounded to 20 newest files as fallback.
 - **Singleton interval** — `globalThis.__agentStatusInterval` is cleared on `/reload`, so no leak.
 - **Lazy env** — `process.env` re-read on each render; tuning works with `/reload`, not just restart.
-- **Shortcut** — `Ctrl+Shift+S` toggles the widget.
+- **Shortcut** — `Ctrl+Shift+A` (or `AGENT_STATUS_SHORTCUT`) toggles the widget.
 
 ## Development
 

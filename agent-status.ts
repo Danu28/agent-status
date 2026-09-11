@@ -30,7 +30,7 @@
  * stats / model timeline when present). Supports `clear` and `--json`.
  *
  * Tuning: AGENT_STATUS_STUCK_MS (default 60000), AGENT_STATUS_ELAPSED (1/0),
- * AGENT_STATUS_TICKER (1/0), AGENT_STATUS_ENABLED (1/0).
+ * AGENT_STATUS_TICKER (1/0), AGENT_STATUS_ENABLED (1/0), AGENT_STATUS_SHORTCUT (default ctrl+shift+a).
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -41,6 +41,7 @@ const getStuckMs = () => Math.max(1_000, Number(process.env.AGENT_STATUS_STUCK_M
 const getShowElapsed = () => (process.env.AGENT_STATUS_ELAPSED ?? "1") !== "0";
 const getShowTicker = () => (process.env.AGENT_STATUS_TICKER ?? "1") !== "0";
 const isEnabled = () => (process.env.AGENT_STATUS_ENABLED ?? "1") !== "0";
+const getShortcut = (): any => (process.env.AGENT_STATUS_SHORTCUT || "ctrl+shift+a").trim() || "ctrl+shift+a";
 
 const CHECK_INTERVAL_MS = 2_000;
 const KEY = "agent-status";
@@ -563,9 +564,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // keyboard shortcut to toggle widget
+  // keyboard shortcut to toggle widget (default ctrl+shift+a; override via AGENT_STATUS_SHORTCUT; was ctrl+shift+s which conflicts with pi-web-access curate shortcut)
   try {
-    pi.registerShortcut("ctrl+shift+s", {
+    pi.registerShortcut(getShortcut(), {
       description: "Toggle agent session status widget",
       handler: async (ctx: any) => {
         if (widgetVisible) {
